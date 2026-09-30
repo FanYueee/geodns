@@ -118,6 +118,37 @@ available on the system (also the default).
 GeoDNS supports query logging to JSON or Avro files (see the sample configuration file
 for options).
 
+## Synchronizing zones across servers
+
+One server can publish its zone JSON files over a read-only HTTP API. Followers
+poll it and mirror those files into their own zone directory. Each server still
+answers DNS queries independently. Zone additions, changes, and deletions are
+picked up by the existing zone reloader, usually within two seconds of a sync.
+
+On the master, add the `[sync]` section shown in
+[`dns/geodns.master.conf.sample`](dns/geodns.master.conf.sample) to its local
+`geodns.conf`. Set `mode = master` and a shared, random `token`. The API is
+`GET /api/v1/zones` on the existing `-http` listener; start that listener on a
+private address or behind an HTTPS reverse proxy. The endpoint requires
+`Authorization: Bearer <token>`, including when HTTP Basic Auth is enabled for
+the other HTTP endpoints.
+
+On each follower, use a dedicated `-config` directory with its own local
+`geodns.conf` based on
+[`dns/geodns.follower.conf.sample`](dns/geodns.follower.conf.sample). Set
+`mode = follower`, `url` to the master's HTTP(S) origin (without the API path),
+the same `token`, and optionally `interval` (default `30s`, minimum `1s`).
+The follower contacts the master immediately on startup and at each interval.
+It keeps its last zone files when the master is unavailable or sends invalid
+data. A successful sync removes local zone JSON files absent from the master,
+so do not put hand-maintained zones in a follower's `-config` directory.
+
+The sync token and role settings are local configuration; changing them takes
+a restart. Keep configuration files containing tokens private (for example,
+mode `0600`). GeoIP databases, health status files, log paths, and other
+node-specific settings are managed separately. Use `-checkconfig` to validate
+local role settings and zone files before starting a node.
+
 ## Prometheus metrics
 
 `/metrics` on the http port provides a number of metrics in Prometheus format.
