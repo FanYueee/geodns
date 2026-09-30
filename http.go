@@ -19,10 +19,16 @@ import (
 )
 
 type httpServer struct {
-	mux        *http.ServeMux
-	zones      *zones.MuxManager
-	serverInfo *monitor.ServerInfo
-	syncMaster *zonesync.Master
+	mux         *http.ServeMux
+	zones       *zones.MuxManager
+	serverInfo  *monitor.ServerInfo
+	syncHandler syncHTTPHandler
+}
+
+type syncHTTPHandler interface {
+	http.Handler
+	ServeStream(http.ResponseWriter, *http.Request)
+	ServeNodes(http.ResponseWriter, *http.Request)
 }
 
 type rate struct {
@@ -63,20 +69,20 @@ func topParam(req *http.Request, def int) int {
 	return topOption
 }
 
-func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo, syncMaster *zonesync.Master) *httpServer {
+func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo, syncHandler syncHTTPHandler) *httpServer {
 
 	hs := &httpServer{
-		zones:      mm,
-		mux:        &http.ServeMux{},
-		serverInfo: serverInfo,
-		syncMaster: syncMaster,
+		zones:       mm,
+		mux:         &http.ServeMux{},
+		serverInfo:  serverInfo,
+		syncHandler: syncHandler,
 	}
 	hs.mux.HandleFunc("/", hs.mainServer)
 	hs.mux.Handle("/metrics", promhttp.Handler())
-	if syncMaster != nil {
-		hs.mux.Handle(zonesync.Path, syncMaster)
-		hs.mux.HandleFunc(zonesync.StreamPath, syncMaster.ServeStream)
-		hs.mux.HandleFunc(zonesync.NodesPath, syncMaster.ServeNodes)
+	if syncHandler != nil {
+		hs.mux.Handle(zonesync.Path, syncHandler)
+		hs.mux.HandleFunc(zonesync.StreamPath, syncHandler.ServeStream)
+		hs.mux.HandleFunc(zonesync.NodesPath, syncHandler.ServeNodes)
 	}
 
 	return hs
@@ -91,7 +97,7 @@ func (hs *httpServer) Run(ctx context.Context, listen string) error {
 
 	srv := http.Server{
 		Addr:         listen,
-		Handler:      &basicauth{h: hs.mux, syncAPI: hs.syncMaster != nil},
+		Handler:      &basicauth{h: hs.mux, syncAPI: hs.syncHandler != nil},
 		ReadTimeout:  5 * time.Second,
 		IdleTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,

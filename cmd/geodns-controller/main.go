@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,14 +10,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/abh/geodns/v3/appconfig"
 	"github.com/abh/geodns/v3/applog"
 	"github.com/abh/geodns/v3/zonesync"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -78,40 +74,15 @@ func main() {
 		}
 		serve(master, master.Run, opts.listen)
 	case "ha":
-		if opts.etcdEndpoints == "" {
-			log.Fatal("etcd endpoints are required in HA mode (set [controller] etcd-endpoints or -etcd)")
-		}
-		endpoints := strings.Split(opts.etcdEndpoints, ",")
-		for i := range endpoints {
-			endpoints[i] = strings.TrimSpace(endpoints[i])
-			if endpoints[i] == "" {
-				log.Fatal("empty etcd endpoint")
-			}
-		}
-		clientConfig := clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second, Username: opts.etcdUser}
-		if opts.etcdPasswordFile != "" {
-			password, err := os.ReadFile(opts.etcdPasswordFile)
-			if err != nil {
-				log.Fatal(err)
-			}
-			clientConfig.Password = strings.TrimSpace(string(password))
-		}
-		if opts.etcdCA != "" || opts.etcdCert != "" || opts.etcdKey != "" {
-			tlsConfig, err := etcdTLS(opts.etcdCA, opts.etcdCert, opts.etcdKey)
-			if err != nil {
-				log.Fatal(err)
-			}
-			clientConfig.TLS = tlsConfig
-		}
-		client, err := clientv3.New(clientConfig)
+		store, err := zonesync.DialStore(zonesync.EtcdOptions{
+			Endpoints: opts.etcdEndpoints, Prefix: opts.etcdPrefix, Username: opts.etcdUser,
+			PasswordFile: opts.etcdPasswordFile, CAFile: opts.etcdCA,
+			CertFile: opts.etcdCert, KeyFile: opts.etcdKey,
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer client.Close()
-		store, err := zonesync.NewStore(client, opts.etcdPrefix)
-		if err != nil {
-			log.Fatal(err)
-		}
+		defer store.Close()
 		if *publish {
 			if *checkConfig {
 				log.Fatal("-publish and -checkconfig cannot be used together")
@@ -145,28 +116,23 @@ type controllerOptions struct {
 }
 
 func (o *controllerOptions) applyConfig(c appconfig.ControllerConfig, configFile string, setFlags map[string]bool) {
+	c = c.ResolvePaths(configFile)
 	choose := func(flagName string, target *string, value string) {
 		if !setFlags[flagName] && value != "" {
 			*target = value
 		}
 	}
-	configPath := func(value string) string {
-		if value == "" || filepath.IsAbs(value) {
-			return value
-		}
-		return filepath.Join(filepath.Dir(configFile), value)
-	}
 	choose("mode", &o.mode, c.Mode)
 	choose("http", &o.listen, c.Listen)
-	choose("config", &o.zoneDir, configPath(c.ZoneDirectory))
+	choose("config", &o.zoneDir, c.ZoneDirectory)
 	choose("id", &o.id, c.ID)
 	choose("etcd", &o.etcdEndpoints, c.EtcdEndpoints)
 	choose("etcd-prefix", &o.etcdPrefix, c.EtcdPrefix)
 	choose("etcd-user", &o.etcdUser, c.EtcdUser)
-	choose("etcd-password-file", &o.etcdPasswordFile, configPath(c.EtcdPasswordFile))
-	choose("etcd-ca", &o.etcdCA, configPath(c.EtcdCA))
-	choose("etcd-cert", &o.etcdCert, configPath(c.EtcdCert))
-	choose("etcd-key", &o.etcdKey, configPath(c.EtcdKey))
+	choose("etcd-password-file", &o.etcdPasswordFile, c.EtcdPasswordFile)
+	choose("etcd-ca", &o.etcdCA, c.EtcdCA)
+	choose("etcd-cert", &o.etcdCert, c.EtcdCert)
+	choose("etcd-key", &o.etcdKey, c.EtcdKey)
 }
 
 type syncHandler interface {
@@ -213,30 +179,4 @@ func run(ctx context.Context, handler syncHandler, start func(context.Context) e
 		return server.Shutdown(shutdownCtx)
 	})
 	return g.Wait()
-}
-
-func etcdTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
-	config := &tls.Config{MinVersion: tls.VersionTLS12}
-	if caFile != "" {
-		data, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(data) {
-			return nil, fmt.Errorf("no CA certificates in %s", caFile)
-		}
-		config.RootCAs = pool
-	}
-	if (certFile == "") != (keyFile == "") {
-		return nil, errors.New("-etcd-cert and -etcd-key must be set together")
-	}
-	if certFile != "" {
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return nil, err
-		}
-		config.Certificates = []tls.Certificate{cert}
-	}
-	return config, nil
 }

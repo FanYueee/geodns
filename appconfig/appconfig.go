@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -74,6 +75,21 @@ type ControllerConfig struct {
 	EtcdCA           string `gcfg:"etcd-ca"`
 	EtcdCert         string `gcfg:"etcd-cert"`
 	EtcdKey          string `gcfg:"etcd-key"`
+}
+
+func (c ControllerConfig) ResolvePaths(configFile string) ControllerConfig {
+	resolve := func(value string) string {
+		if value == "" || filepath.IsAbs(value) {
+			return value
+		}
+		return filepath.Join(filepath.Dir(configFile), value)
+	}
+	c.ZoneDirectory = resolve(c.ZoneDirectory)
+	c.EtcdPasswordFile = resolve(c.EtcdPasswordFile)
+	c.EtcdCA = resolve(c.EtcdCA)
+	c.EtcdCert = resolve(c.EtcdCert)
+	c.EtcdKey = resolve(c.EtcdKey)
+	return c
 }
 
 // Singleton to keep the latest read config

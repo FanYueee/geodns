@@ -163,53 +163,67 @@ serve a given set of followers in this mode.
 
 For automatic controller failover, deploy three etcd members on separate hosts
 reachable over a private network. On each host, copy
-[`dns/etcd.ha.yml.sample`](dns/etcd.ha.yml.sample) to `/etc/geodns/etcd.yml`
-and [`dns/geodns.controller.ha.conf.sample`](dns/geodns.controller.ha.conf.sample)
-to `/etc/geodns/controller.conf`. Change the etcd member name and local IPs,
-and the controller `id` and `listen`, for each host. Keep the three-member
-`initial-cluster` list, etcd endpoints, prefix, and sync token identical.
-Give etcd a persistent, writable data directory. After editing the two files,
-start both processes on each host:
+[`dns/etcd.ha.yml.sample`](dns/etcd.ha.yml.sample) to `/etc/geodns/etcd.yml`.
+Change the member name and its local IPs on each host, but keep the complete
+three-member `initial-cluster` list identical. Give etcd a persistent, writable
+data directory and start it with `etcd --config-file /etc/geodns/etcd.yml`.
+
+When each host also serves DNS, build only `geodns` and put a copy of
+[`dns/geodns.ha-node.conf.sample`](dns/geodns.ha-node.conf.sample) in each
+node's dedicated `-config` directory as `geodns.conf`. Use a unique `[sync] id`
+and the host's private `[controller] listen` address; keep `urls`,
+`etcd-endpoints`, `etcd-prefix`, and the token identical. Start one GeoDNS
+process per host:
 
 ```sh
-etcd --config-file /etc/geodns/etcd.yml
-geodns-controller -configfile /etc/geodns/controller.conf
+geodns -config /srv/geodns/node
 ```
 
-Run these as separate long-lived services in production. On the host holding
-the authoritative Zone directory, set `zone-directory` in `controller.conf` and
-publish the first revision with:
+This process answers DNS, participates in controller election, and connects to
+the elected leader to receive zones, including when it is the leader. The
+private HTTP listener uses `[controller] listen`; `-http` overrides it. Keep
+the node's `-config` directory for synced zones and its local `geodns.conf`.
+On the publishing host, set `[controller] zone-directory` to a **separate**
+directory containing authoritative Zone JSON files. Publish with the same
+binary and config:
 
 ```sh
-geodns-controller -configfile /etc/geodns/controller.conf -publish
+geodns -config /srv/geodns/node -publish
 ```
 
 Repeat the publish command after every Zone change. It validates the files,
 stores a complete snapshot in etcd, and atomically makes that snapshot current.
-HA controllers do not watch local Zone files while serving. Only the controller
-holding the election lease accepts node connections; others return HTTP 503.
+The HA mode does not watch the authoritative Zone directory while serving.
+Only the controller holding the election lease accepts node connections;
+others return HTTP 503. Run etcd and GeoDNS as separate long-lived services
+in production.
+
+For independent controller processes instead, copy
+[`dns/geodns.controller.ha.conf.sample`](dns/geodns.controller.ha.conf.sample)
+to `/etc/geodns/controller.conf` on each controller host. Change its `id` and
+`listen` for that host; keep endpoints, prefix, and token identical. Start it
+with `geodns-controller -configfile /etc/geodns/controller.conf` and publish
+with the same command plus `-publish`. In that layout, use
+[`dns/geodns.follower.ha.conf.sample`](dns/geodns.follower.ha.conf.sample) on
+each separate PoP. The node tries the next controller on disconnect and keeps
+answering with its last applied zones while no leader is available.
 The controller's existing `-mode`, `-id`, `-http`, `-config`, `-etcd`, and
 `-etcd-*` flags remain available and override the corresponding config entries
 when explicitly provided. Relative paths in `[controller]` resolve from the
 controller config file's directory.
 
-On each PoP, use the
-[`dns/geodns.follower.ha.conf.sample`](dns/geodns.follower.ha.conf.sample)
-pattern: set `urls` to all controller HTTP(S) origins, a unique node `id`, and
-the shared token. The node tries the next controller on disconnect and preserves
-its last applied zones while no leader is available. The leader persists known
-node status every five seconds; a new leader initially marks those nodes offline
-until they reconnect. An abrupt controller failure requires its ten-second etcd
-lease to expire, followed by node reconnection. The HA mode requires an
-etcd quorum; `-etcd-user`, `-etcd-password-file`, `-etcd-ca`, `-etcd-cert`, and
-`-etcd-key` are available for authenticated TLS deployments. Restrict controller
-and etcd ports to the private network. etcd should have persistent storage,
-backups and compaction configured. This feature does not configure WireGuard,
-probe DNS service availability, or control BGP announcements.
+The leader persists known node status every five seconds; a new leader
+initially marks those nodes offline until they reconnect. An abrupt controller
+failure requires its ten-second etcd lease to expire, followed by node
+reconnection. The HA mode requires an etcd quorum; `[controller]` also accepts
+`etcd-user`, `etcd-password-file`, `etcd-ca`, `etcd-cert`, and `etcd-key` for
+authenticated TLS deployments. Restrict controller and etcd ports to the
+private network. etcd should have persistent storage, backups and compaction
+configured. This feature does not configure WireGuard, probe DNS service
+availability, or control BGP announcements.
 A single WireGuard hub remains a separate failure point even with three etcd
 members; provide redundant tunnel paths if controller failover must survive a
-hub outage. A controller candidate can run on the same host as a PoP's GeoDNS
-process, but it uses a separate config directory and never serves DNS itself.
+hub outage.
 
 The sync token and role settings are local configuration; changing them takes
 a restart. Keep configuration files containing tokens private (for example,

@@ -1,0 +1,25 @@
+; Run one geodns process per host for DNS, sync, and controller election.
+; Put this file in the node's -config directory with no hand-managed zone JSON.
+
+[dns]
+detailedmetrics = true
+
+[sync]
+mode = ha
+id = pop-1
+urls = http://10.80.0.11:8053,http://10.80.0.12:8053,http://10.80.0.13:8053
+token = replace-with-the-same-long-random-secret
+
+[controller]
+mode = ha
+listen = 10.80.0.11:8053
+etcd-endpoints = http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379
+etcd-prefix = /geodns/production
+; Only the publishing host needs a separate directory of authoritative zones.
+; zone-directory = /srv/geodns/source-zones
+; Optional authenticated etcd connection:
+; etcd-user = geodns
+; etcd-password-file = /etc/geodns/etcd-password
+; etcd-ca = /etc/geodns/etcd-ca.pem
+; etcd-cert = /etc/geodns/etcd-client.pem
+; etcd-key = /etc/geodns/etcd-client-key.pem

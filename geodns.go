@@ -55,6 +55,7 @@ var (
 	flagconfig      = flag.String("config", "./dns/", "directory of zone files")
 	flagconfigfile  = flag.String("configfile", "geodns.conf", "filename of config file (in 'config' directory)")
 	flagcheckconfig = flag.Bool("checkconfig", false, "check configuration and exit")
+	flagpublish     = flag.Bool("publish", false, "publish HA zones to etcd and exit")
 	flagidentifier  = flag.String("identifier", "", "identifier (hostname, pop name or similar)")
 	flaginter       = flag.String("interface", "*", "set the listener address")
 	flagport        = flag.String("port", "53", "default port number")
@@ -121,7 +122,39 @@ func main() {
 		os.Exit(2)
 	}
 
-	syncMaster, syncFollower, err := configureSync(appconfig.Config.Sync, *flagconfig, *flaghttp)
+	if *flagpublish {
+		if *flagcheckconfig {
+			log.Fatal("-publish and -checkconfig cannot be used together")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		revision, err := publishHANode(ctx, *appconfig.Config, configFileName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(revision)
+		return
+	}
+
+	var syncMaster *zonesync.Master
+	var syncFollower *zonesync.Follower
+	var ha *haNode
+	if appconfig.Config.Sync.Mode == "ha" {
+		httpExplicit := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "http" {
+				httpExplicit = true
+			}
+		})
+		ha, err = newHANode(*appconfig.Config, *flagconfig, configFileName, *flaghttp, httpExplicit)
+		if err == nil {
+			*flaghttp = ha.httpAddr
+			syncFollower = ha.follower
+			defer ha.store.Close()
+		}
+	} else {
+		syncMaster, syncFollower, err = configureSync(appconfig.Config.Sync, *flagconfig, *flaghttp)
+	}
 	if err != nil {
 		log.Printf("invalid sync configuration: %s", err)
 		os.Exit(2)
@@ -262,6 +295,9 @@ func main() {
 	if syncMaster != nil {
 		g.Go(func() error { return syncMaster.Run(ctx) })
 	}
+	if ha != nil {
+		g.Go(func() error { return ha.controller.Run(ctx) })
+	}
 
 	g.Go(func() error {
 		muxm.Run(ctx)
@@ -293,7 +329,13 @@ func main() {
 
 	if len(*flaghttp) > 0 {
 		g.Go(func() error {
-			hs := NewHTTPServer(muxm, serverInfo, syncMaster)
+			var syncHandler syncHTTPHandler
+			if ha != nil {
+				syncHandler = ha.controller
+			} else if syncMaster != nil {
+				syncHandler = syncMaster
+			}
+			hs := NewHTTPServer(muxm, serverInfo, syncHandler)
 			err := hs.Run(ctx, *flaghttp)
 			return err
 		})
