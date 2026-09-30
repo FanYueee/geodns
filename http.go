@@ -75,6 +75,8 @@ func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo, syncMas
 	hs.mux.Handle("/metrics", promhttp.Handler())
 	if syncMaster != nil {
 		hs.mux.Handle(zonesync.Path, syncMaster)
+		hs.mux.HandleFunc(zonesync.StreamPath, syncMaster.ServeStream)
+		hs.mux.HandleFunc(zonesync.NodesPath, syncMaster.ServeNodes)
 	}
 
 	return hs
@@ -132,7 +134,7 @@ type basicauth struct {
 }
 
 func (b *basicauth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if b.syncAPI && r.URL.Path == zonesync.Path {
+	if b.syncAPI && (r.URL.Path == zonesync.Path || r.URL.Path == zonesync.StreamPath || r.URL.Path == zonesync.NodesPath) {
 		b.h.ServeHTTP(w, r)
 		return
 	}

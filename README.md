@@ -120,28 +120,106 @@ for options).
 
 ## Synchronizing zones across servers
 
-One server can publish its zone JSON files over a read-only HTTP API. Followers
-poll it and mirror those files into their own zone directory. Each server still
-answers DNS queries independently. Zone additions, changes, and deletions are
-picked up by the existing zone reloader, usually within two seconds of a sync.
+One server publishes its zone JSON files to followers over authenticated
+WebSocket connections. Each follower connects outward to the master and answers
+DNS queries independently. Changes are pushed when the master's zone directory
+changes; the follower validates and reloads them before acknowledging a revision.
+Omit `[sync]` to keep running as a standalone server.
 
 On the master, add the `[sync]` section shown in
 [`dns/geodns.master.conf.sample`](dns/geodns.master.conf.sample) to its local
-`geodns.conf`. Set `mode = master` and a shared, random `token`. The API is
-`GET /api/v1/zones` on the existing `-http` listener; start that listener on a
-private address or behind an HTTPS reverse proxy. The endpoint requires
-`Authorization: Bearer <token>`, including when HTTP Basic Auth is enabled for
-the other HTTP endpoints.
+`geodns.conf`. Set `mode = master` and a shared, random `token`. The stream is
+`GET /api/v1/stream` on the existing `-http` listener; start that listener on a
+private address or behind an HTTPS reverse proxy that supports WebSocket upgrades.
+All sync endpoints require `Authorization: Bearer <token>`, including when HTTP
+Basic Auth is enabled for other HTTP endpoints. `GET /api/v1/nodes` returns
+connected state, last heartbeat, applied revision and last error for each node.
+These fields show sync connection and application status, not a DNS query probe.
 
 On each follower, use a dedicated `-config` directory with its own local
 `geodns.conf` based on
 [`dns/geodns.follower.conf.sample`](dns/geodns.follower.conf.sample). Set
-`mode = follower`, `url` to the master's HTTP(S) origin (without the API path),
-the same `token`, and optionally `interval` (default `30s`, minimum `1s`).
-The follower contacts the master immediately on startup and at each interval.
-It keeps its last zone files when the master is unavailable or sends invalid
-data. A successful sync removes local zone JSON files absent from the master,
-so do not put hand-maintained zones in a follower's `-config` directory.
+`mode = follower`, a unique `id`, `url` to the master's HTTP(S) origin (without
+the API path), and the same `token`. The follower connects at startup and
+automatically reconnects after a disconnect. The master sends a WebSocket ping
+every five seconds and marks an unresponsive node offline after 15 seconds.
+Connection, disconnection, heartbeat timeout, and failed or successful zone
+application are written to the normal process log on both sides (stderr by
+default, or the file selected by `-logfile`). Disconnection records include the
+node ID, remote address, reason, and last contact time. A successful sync removes
+local zone JSON files absent from the master; do not put hand-maintained zones in a
+follower's `-config` directory. If the master is unavailable, the node keeps
+answering with its last applied zones.
+
+The existing `mode = master` runs inside the GeoDNS process. To run the same
+single-master behavior without a DNS listener, build the controller with
+`go build -o geodns-controller ./cmd/geodns-controller` and start it with
+`-mode single`, `-config` pointing to the zone directory,
+`-configfile` pointing to a config based on
+[`dns/geodns.controller.conf.sample`](dns/geodns.controller.conf.sample), and
+`-http` on the private network.
+Its `-logfile` and `-checkconfig` flags work like GeoDNS's. Only one master should
+serve a given set of followers in this mode.
+
+For automatic controller failover, deploy a three-member etcd cluster on separate
+failure domains, reachable over the private WireGuard network. Each controller
+runs the standalone binary with `-mode ha`, a unique `-id`, the same `-etcd`
+endpoint list and `-etcd-prefix`, and a local config with `mode = controller`
+plus the shared token. HA controllers do not read local zone files while
+serving: etcd stores the published snapshot, and only the controller holding the
+election lease accepts node connections. The controller returns HTTP 503 until a
+snapshot is published or whenever it is not the ready leader.
+For example, start the first etcd member with the following settings, changing
+`--name`, its local IP and data directory on the other two members:
+
+```sh
+etcd --name controller-1 --data-dir /var/lib/etcd-geodns \
+  --listen-client-urls http://10.80.0.11:2379 \
+  --advertise-client-urls http://10.80.0.11:2379 \
+  --listen-peer-urls http://10.80.0.11:2380 \
+  --initial-advertise-peer-urls http://10.80.0.11:2380 \
+  --initial-cluster controller-1=http://10.80.0.11:2380,controller-2=http://10.80.0.12:2380,controller-3=http://10.80.0.13:2380 \
+  --initial-cluster-token geodns-production --initial-cluster-state new
+```
+
+Publish each new Zone revision from the machine holding the authoritative zone
+directory. The command checks zone files, stores the snapshot in etcd, then
+atomically makes it current:
+
+```sh
+geodns-controller -mode ha -publish -config /srv/geodns/zones \
+  -configfile /srv/geodns/controller/geodns.controller.conf \
+  -etcd http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379 \
+  -etcd-prefix /geodns/production
+```
+
+Start each controller with the same etcd settings, a distinct `-id`, and its
+own private `-http` address. For example, the first controller can use:
+
+```sh
+geodns-controller -mode ha -id controller-1 -config /srv/geodns/controller \
+  -configfile geodns.controller.conf -http 10.80.0.11:8053 \
+  -etcd http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379 \
+  -etcd-prefix /geodns/production
+```
+
+On each PoP, use the
+[`dns/geodns.follower.ha.conf.sample`](dns/geodns.follower.ha.conf.sample)
+pattern: set `urls` to all controller HTTP(S) origins, a unique node `id`, and
+the shared token. The node tries the next controller on disconnect and preserves
+its last applied zones while no leader is available. The leader persists known
+node status every five seconds; a new leader initially marks those nodes offline
+until they reconnect. An abrupt controller failure requires its ten-second etcd
+lease to expire, followed by node reconnection. The HA mode requires an
+etcd quorum; `-etcd-user`, `-etcd-password-file`, `-etcd-ca`, `-etcd-cert`, and
+`-etcd-key` are available for authenticated TLS deployments. Restrict controller
+and etcd ports to the private network. etcd should have persistent storage,
+backups and compaction configured. This feature does not configure WireGuard,
+probe DNS service availability, or control BGP announcements.
+A single WireGuard hub remains a separate failure point even with three etcd
+members; provide redundant tunnel paths if controller failover must survive a
+hub outage. A controller candidate can run on the same host as a PoP's GeoDNS
+process, but it uses a separate config directory and never serves DNS itself.
 
 The sync token and role settings are local configuration; changing them takes
 a restart. Keep configuration files containing tokens private (for example,

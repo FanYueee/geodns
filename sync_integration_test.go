@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -33,13 +35,13 @@ func TestFollowerServesUpdatedMasterZone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	httpServer := httptest.NewServer(master)
+	masterHTTP := http.NewServeMux()
+	masterHTTP.HandleFunc(zonesync.StreamPath, master.ServeStream)
+	masterHTTP.HandleFunc(zonesync.NodesPath, master.ServeNodes)
+	httpServer := httptest.NewServer(masterHTTP)
 	defer httpServer.Close()
-	follower, err := zonesync.NewFollower(followerDir, httpServer.URL, "secret", "1s")
+	follower, err := zonesync.NewFollower(followerDir, httpServer.URL, "secret", "node-1")
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := follower.Pull(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,9 +59,12 @@ func TestFollowerServesUpdatedMasterZone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	follower.SetReload(mux.Reload)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	syncDone := make(chan struct{})
+	masterDone := make(chan error, 1)
+	go func() { masterDone <- master.Run(ctx) }()
 	go func() {
 		mux.Run(ctx)
 		close(done)
@@ -72,33 +77,41 @@ func TestFollowerServesUpdatedMasterZone(t *testing.T) {
 		cancel()
 		<-done
 		<-syncDone
+		if err := <-masterDone; err != nil {
+			t.Errorf("master watcher: %s", err)
+		}
 	}()
 
-	answerIP := func() string {
-		t.Helper()
+	answerIP := func() (string, error) {
 		recorder := dnstest.NewTestRecorder()
 		dnsServer.ServeDNS(ctx, recorder, dns.NewMsg("www.example.com.", dns.TypeA))
 		if recorder.Msg == nil {
-			t.Fatal("DNS server sent no response")
+			return "", fmt.Errorf("DNS server sent no response")
 		}
 		if err := recorder.Msg.Unpack(); err != nil {
-			t.Fatal(err)
+			return "", err
 		}
 		if len(recorder.Msg.Answer) != 1 {
-			t.Fatalf("expected one A record, got %d", len(recorder.Msg.Answer))
+			return "", fmt.Errorf("expected one A record, got %d", len(recorder.Msg.Answer))
 		}
-		return recorder.Msg.Answer[0].(*dns.A).Addr.String()
+		return recorder.Msg.Answer[0].(*dns.A).Addr.String(), nil
 	}
-	if got := answerIP(); got != "192.0.2.1" {
-		t.Fatalf("initial answer = %s", got)
+	waitAnswer := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			got, err := answerIP()
+			if err == nil && got == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("DNS answer = %s, error = %v; want %s", got, err, want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
+	waitAnswer("192.0.2.1")
 
 	write("192.0.2.2")
-	deadline := time.Now().Add(5 * time.Second)
-	for answerIP() != "192.0.2.2" {
-		if time.Now().After(deadline) {
-			t.Fatal("follower did not serve the updated A record")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitAnswer("192.0.2.2")
 }

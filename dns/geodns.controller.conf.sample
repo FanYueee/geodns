@@ -1,0 +1,5 @@
+; Standalone controller only. Do not use this file to start the GeoDNS DNS server.
+
+[sync]
+mode = controller
+token = replace-with-the-same-long-random-secret

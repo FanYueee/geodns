@@ -55,7 +55,9 @@ type AppConfig struct {
 type SyncConfig struct {
 	Mode     string
 	URL      string
+	URLs     string
 	Token    string
+	ID       string
 	Interval string
 }
 

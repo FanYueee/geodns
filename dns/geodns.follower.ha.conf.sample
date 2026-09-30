@@ -1,0 +1,11 @@
+; Follower using three independent controllers over the private tunnel.
+; Keep this file in its own -config directory with no hand-managed zone JSON.
+
+[dns]
+detailedmetrics = true
+
+[sync]
+mode = follower
+id = pop-1
+urls = http://10.80.0.11:8053,http://10.80.0.12:8053,http://10.80.0.13:8053
+token = replace-with-the-same-long-random-secret

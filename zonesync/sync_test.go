@@ -42,7 +42,7 @@ func TestMasterFollowerSync(t *testing.T) {
 		t.Fatalf("without token: got HTTP %d", res.StatusCode)
 	}
 
-	follower, err := NewFollower(followerDir, server.URL, "secret", "1s")
+	follower, err := NewFollower(followerDir, server.URL, "secret", "node-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestFollowerRejectsInvalidSnapshotBeforeWriting(t *testing.T) {
 		})
 	}))
 	defer server.Close()
-	follower, err := NewFollower(dir, server.URL, "secret", "")
+	follower, err := NewFollower(dir, server.URL, "secret", "node-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestFollowerRejectsUnsafeNames(t *testing.T) {
 		json.NewEncoder(w).Encode(snapshot{Version: 1, Zones: map[string]json.RawMessage{"../outside.json": json.RawMessage(testZone)}})
 	}))
 	defer server.Close()
-	follower, err := NewFollower(dir, server.URL, "secret", "")
+	follower, err := NewFollower(dir, server.URL, "secret", "node-1")
 	if err != nil {
 		t.Fatal(err)
 	}

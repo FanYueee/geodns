@@ -256,6 +256,12 @@ func main() {
 	if err != nil {
 		log.Printf("error loading zones: %s", err)
 	}
+	if syncFollower != nil {
+		syncFollower.SetReload(muxm.Reload)
+	}
+	if syncMaster != nil {
+		g.Go(func() error { return syncMaster.Run(ctx) })
+	}
 
 	g.Go(func() error {
 		muxm.Run(ctx)
@@ -312,7 +318,7 @@ func main() {
 func configureSync(cfg appconfig.SyncConfig, dir, httpAddr string) (*zonesync.Master, *zonesync.Follower, error) {
 	switch cfg.Mode {
 	case "":
-		if cfg.URL != "" || cfg.Token != "" || cfg.Interval != "" {
+		if cfg.URL != "" || cfg.URLs != "" || cfg.Token != "" || cfg.ID != "" || cfg.Interval != "" {
 			return nil, nil, fmt.Errorf("sync mode is required when sync options are set")
 		}
 		return nil, nil, nil
@@ -320,14 +326,30 @@ func configureSync(cfg appconfig.SyncConfig, dir, httpAddr string) (*zonesync.Ma
 		if httpAddr == "" {
 			return nil, nil, fmt.Errorf("master mode requires the HTTP listener")
 		}
-		if cfg.URL != "" || cfg.Interval != "" {
+		if cfg.URL != "" || cfg.URLs != "" || cfg.ID != "" || cfg.Interval != "" {
 			return nil, nil, fmt.Errorf("master mode only accepts a token")
 		}
 		master, err := zonesync.NewMaster(dir, cfg.Token)
 		return master, nil, err
 	case "follower":
-		follower, err := zonesync.NewFollower(dir, cfg.URL, cfg.Token, cfg.Interval)
+		if cfg.Interval != "" {
+			return nil, nil, fmt.Errorf("sync interval is no longer used; remove it from follower configuration")
+		}
+		if cfg.URLs != "" {
+			if cfg.URL != "" {
+				return nil, nil, fmt.Errorf("set either sync url or urls, not both")
+			}
+			parts := strings.Split(cfg.URLs, ",")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+			follower, err := zonesync.NewFollowerWithURLs(dir, parts, cfg.Token, cfg.ID)
+			return nil, follower, err
+		}
+		follower, err := zonesync.NewFollower(dir, cfg.URL, cfg.Token, cfg.ID)
 		return nil, follower, err
+	case "controller":
+		return nil, nil, fmt.Errorf("controller mode requires the geodns-controller binary")
 	default:
 		return nil, nil, fmt.Errorf("unknown sync mode %q", cfg.Mode)
 	}

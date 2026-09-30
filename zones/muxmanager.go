@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	dns "codeberg.org/miekg/dns"
@@ -21,6 +22,7 @@ type RegistrationAPI interface {
 }
 
 type MuxManager struct {
+	reloadMu sync.Mutex
 	reg      RegistrationAPI
 	zonelist ZoneList
 	path     string
@@ -49,14 +51,14 @@ func NewMuxManager(path string, reg RegistrationAPI) (*MuxManager, error) {
 	mm.setupRootZone()
 	mm.setupPgeodnsZone()
 
-	err := mm.reload()
+	err := mm.Reload()
 
 	return mm, err
 }
 
 func (mm *MuxManager) Run(ctx context.Context) {
 	for {
-		err := mm.reload()
+		err := mm.Reload()
 		if err != nil {
 			log.Printf("error reading zones: %s", err)
 		}
@@ -66,6 +68,13 @@ func (mm *MuxManager) Run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// Reload applies zone file changes immediately. It can run alongside Run.
+func (mm *MuxManager) Reload() error {
+	mm.reloadMu.Lock()
+	defer mm.reloadMu.Unlock()
+	return mm.reload()
 }
 
 // Zones returns the list of currently active zones in the mux manager.

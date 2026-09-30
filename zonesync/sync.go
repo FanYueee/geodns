@@ -2,7 +2,9 @@ package zonesync
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,23 +15,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/abh/geodns/v3/zones"
 )
 
-const Path = "/api/v1/zones"
+const (
+	Path       = "/api/v1/zones"
+	StreamPath = "/api/v1/stream"
+	NodesPath  = "/api/v1/nodes"
+)
 
 const maxSnapshotSize = 64 << 20
 
 type snapshot struct {
-	Version int                        `json:"version"`
-	Zones   map[string]json.RawMessage `json:"zones"`
+	Version  int                        `json:"version"`
+	Revision string                     `json:"revision"`
+	Zones    map[string]json.RawMessage `json:"zones"`
 }
 
 type Master struct {
-	dir   string
-	token string
+	dir       string
+	token     string
+	mu        sync.Mutex
+	accepting bool
+	latest    snapshot
+	peers     map[string]*peer
+	statuses  map[string]NodeStatus
 }
 
 func NewMaster(dir, token string) (*Master, error) {
@@ -39,7 +52,22 @@ func NewMaster(dir, token string) (*Master, error) {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("sync zone directory %q is unavailable", dir)
 	}
-	return &Master{dir: dir, token: token}, nil
+	s, err := readSnapshot(dir)
+	if err != nil {
+		return nil, err
+	}
+	m := newMaster(token, s)
+	m.dir = dir
+	return m, nil
+}
+
+func newMaster(token string, s snapshot) *Master {
+	return &Master{token: token, accepting: true, latest: s, peers: make(map[string]*peer), statuses: make(map[string]NodeStatus)}
+}
+
+func (m *Master) authorized(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	return strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(m.token)) == 1
 }
 
 func (m *Master) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,17 +76,24 @@ func (m *Master) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(m.token)) != 1 {
+	if !m.authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	s, err := readSnapshot(m.dir)
-	if err != nil {
-		log.Printf("zone sync snapshot: %s", err)
-		http.Error(w, "could not read zones", http.StatusServiceUnavailable)
-		return
+	var s snapshot
+	if m.dir != "" {
+		var err error
+		s, err = readSnapshot(m.dir)
+		if err != nil {
+			log.Printf("zone sync snapshot: %s", err)
+			http.Error(w, "could not read zones", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		m.mu.Lock()
+		s = m.latest
+		m.mu.Unlock()
 	}
 	data, err := json.Marshal(s)
 	if err != nil || len(data) > maxSnapshotSize {
@@ -104,7 +139,21 @@ func readSnapshot(dir string) (snapshot, error) {
 		}
 		s.Zones[name] = data
 	}
+	revision, err := revisionOfZones(s.Zones)
+	if err != nil {
+		return snapshot{}, err
+	}
+	s.Revision = revision
 	return s, nil
+}
+
+func revisionOfZones(zones map[string]json.RawMessage) (string, error) {
+	data, err := json.Marshal(zones)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 func zoneFile(name string) bool {
@@ -123,48 +172,46 @@ func zoneFile(name string) bool {
 }
 
 type Follower struct {
-	dir      string
-	url      string
-	token    string
-	interval time.Duration
-	client   *http.Client
+	dir     string
+	url     string
+	urls    []string
+	token   string
+	id      string
+	nextURL int
+	reload  func() error
+	client  *http.Client
 }
 
-func NewFollower(dir, masterURL, token, interval string) (*Follower, error) {
+func NewFollower(dir, masterURL, token, id string) (*Follower, error) {
+	return NewFollowerWithURLs(dir, []string{masterURL}, token, id)
+}
+
+// NewFollowerWithURLs tries each controller when the current one is unavailable.
+func NewFollowerWithURLs(dir string, masterURLs []string, token, id string) (*Follower, error) {
 	if token == "" {
 		return nil, errors.New("sync token is required for follower mode")
 	}
-	u, err := url.Parse(masterURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("sync URL must be an HTTP(S) origin: %q", masterURL)
+	if !validNodeID(id) {
+		return nil, errors.New("sync follower id must contain 1-64 letters, digits, dots, underscores or hyphens")
 	}
-	if interval == "" {
-		interval = "30s"
+	if len(masterURLs) == 0 {
+		return nil, errors.New("at least one sync URL is required")
 	}
-	period, err := time.ParseDuration(interval)
-	if err != nil || period < time.Second {
-		return nil, fmt.Errorf("sync interval must be at least 1s: %q", interval)
+	urls := make([]string, 0, len(masterURLs))
+	for _, masterURL := range masterURLs {
+		u, err := url.Parse(masterURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("sync URL must be an HTTP(S) origin: %q", masterURL)
+		}
+		urls = append(urls, strings.TrimSuffix(masterURL, "/")+Path)
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("sync zone directory %q is unavailable", dir)
 	}
-	return &Follower{dir: dir, url: strings.TrimSuffix(masterURL, "/") + Path, token: token, interval: period, client: &http.Client{Timeout: 15 * time.Second}}, nil
+	return &Follower{dir: dir, url: urls[0], urls: urls, token: token, id: id, client: &http.Client{Timeout: 15 * time.Second}}, nil
 }
 
-func (f *Follower) Run(ctx context.Context) {
-	ticker := time.NewTicker(f.interval)
-	defer ticker.Stop()
-	for {
-		if err := f.Pull(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("zone sync: %s", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
+func (f *Follower) SetReload(fn func() error) { f.reload = fn }
 
 func (f *Follower) Pull(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
