@@ -1,0 +1,11 @@
+; Follower node. Use a dedicated -config directory: all zone JSON files in it
+; are managed by synchronization. Keep this config file local to the node.
+
+[dns]
+detailedmetrics = true
+
+[sync]
+mode = follower
+url = https://master.example.net
+token = replace-with-the-same-long-random-secret
+interval = 30s

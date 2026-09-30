@@ -46,6 +46,7 @@ import (
 	"github.com/abh/geodns/v3/targeting"
 	"github.com/abh/geodns/v3/targeting/geoip2"
 	"github.com/abh/geodns/v3/zones"
+	"github.com/abh/geodns/v3/zonesync"
 )
 
 var serverInfo *monitor.ServerInfo
@@ -114,12 +115,19 @@ func main() {
 		configFileName = filepath.Clean(filepath.Join(*flagconfig, *flagconfigfile))
 	}
 
+	err := appconfig.ConfigReader(configFileName)
+	if err != nil {
+		log.Printf("error reading config file %s: %s", configFileName, err)
+		os.Exit(2)
+	}
+
+	syncMaster, syncFollower, err := configureSync(appconfig.Config.Sync, *flagconfig, *flaghttp)
+	if err != nil {
+		log.Printf("invalid sync configuration: %s", err)
+		os.Exit(2)
+	}
+
 	if *flagcheckconfig {
-		err := appconfig.ConfigReader(configFileName)
-		if err != nil {
-			log.Println("Errors reading config", err)
-			os.Exit(2)
-		}
 
 		dirName := *flagconfig
 
@@ -169,13 +177,6 @@ func main() {
 			log.Println("stopping profile")
 			pprof.StopCPUProfile()
 		}()
-	}
-
-	// load geodns.conf config
-	err := appconfig.ConfigReader(configFileName)
-	if err != nil {
-		log.Printf("error reading config file %s: %s", configFileName, err)
-		os.Exit(2)
 	}
 
 	if len(appconfig.Config.Health.Directory) > 0 {
@@ -260,6 +261,12 @@ func main() {
 		muxm.Run(ctx)
 		return nil
 	})
+	if syncFollower != nil {
+		g.Go(func() error {
+			syncFollower.Run(ctx)
+			return nil
+		})
+	}
 
 	for _, host := range inter {
 		host := host
@@ -280,7 +287,7 @@ func main() {
 
 	if len(*flaghttp) > 0 {
 		g.Go(func() error {
-			hs := NewHTTPServer(muxm, serverInfo)
+			hs := NewHTTPServer(muxm, serverInfo, syncMaster)
 			err := hs.Run(ctx, *flaghttp)
 			return err
 		})
@@ -300,4 +307,28 @@ func main() {
 		f.Close()
 	}
 	applog.FileClose()
+}
+
+func configureSync(cfg appconfig.SyncConfig, dir, httpAddr string) (*zonesync.Master, *zonesync.Follower, error) {
+	switch cfg.Mode {
+	case "":
+		if cfg.URL != "" || cfg.Token != "" || cfg.Interval != "" {
+			return nil, nil, fmt.Errorf("sync mode is required when sync options are set")
+		}
+		return nil, nil, nil
+	case "master":
+		if httpAddr == "" {
+			return nil, nil, fmt.Errorf("master mode requires the HTTP listener")
+		}
+		if cfg.URL != "" || cfg.Interval != "" {
+			return nil, nil, fmt.Errorf("master mode only accepts a token")
+		}
+		master, err := zonesync.NewMaster(dir, cfg.Token)
+		return master, nil, err
+	case "follower":
+		follower, err := zonesync.NewFollower(dir, cfg.URL, cfg.Token, cfg.Interval)
+		return nil, follower, err
+	default:
+		return nil, nil, fmt.Errorf("unknown sync mode %q", cfg.Mode)
+	}
 }

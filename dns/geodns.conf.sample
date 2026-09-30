@@ -41,3 +41,9 @@ path = log/queries.log
 
 [health]
 ; directory = dns/health
+
+; Optional zone synchronization. Keep geodns.conf local to each node.
+; See geodns.master.conf.sample and geodns.follower.conf.sample.
+; [sync]
+; mode = master
+; token = replace-with-a-long-random-secret

@@ -38,6 +38,7 @@ func (zone *Zone) ReadZoneFile(fileName string) (zerr error) {
 		log.Printf("Could not read '%s': %s", fileName, err)
 		panic(err)
 	}
+	defer fh.Close()
 
 	fileInfo, err := fh.Stat()
 	if err != nil {

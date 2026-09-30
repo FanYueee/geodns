@@ -38,6 +38,7 @@ type AppConfig struct {
 	Health struct {
 		Directory string
 	}
+	Sync     SyncConfig
 	Nodeping struct {
 		Token string
 	}
@@ -49,6 +50,13 @@ type AppConfig struct {
 		AppKey       string
 		StateMap     string
 	}
+}
+
+type SyncConfig struct {
+	Mode     string
+	URL      string
+	Token    string
+	Interval string
 }
 
 // Singleton to keep the latest read config

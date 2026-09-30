@@ -1,0 +1,10 @@
+; Master node. Put this file and authoritative zone JSON files in the directory
+; selected by -config. Run with -configfile geodns.master.conf.sample or rename
+; it to geodns.conf.
+
+[dns]
+detailedmetrics = true
+
+[sync]
+mode = master
+token = replace-with-a-long-random-secret

@@ -13,6 +13,7 @@ import (
 	"github.com/abh/geodns/v3/appconfig"
 	"github.com/abh/geodns/v3/monitor"
 	"github.com/abh/geodns/v3/zones"
+	"github.com/abh/geodns/v3/zonesync"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 )
@@ -21,6 +22,7 @@ type httpServer struct {
 	mux        *http.ServeMux
 	zones      *zones.MuxManager
 	serverInfo *monitor.ServerInfo
+	syncMaster *zonesync.Master
 }
 
 type rate struct {
@@ -61,15 +63,19 @@ func topParam(req *http.Request, def int) int {
 	return topOption
 }
 
-func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo) *httpServer {
+func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo, syncMaster *zonesync.Master) *httpServer {
 
 	hs := &httpServer{
 		zones:      mm,
 		mux:        &http.ServeMux{},
 		serverInfo: serverInfo,
+		syncMaster: syncMaster,
 	}
 	hs.mux.HandleFunc("/", hs.mainServer)
 	hs.mux.Handle("/metrics", promhttp.Handler())
+	if syncMaster != nil {
+		hs.mux.Handle(zonesync.Path, syncMaster)
+	}
 
 	return hs
 }
@@ -83,7 +89,7 @@ func (hs *httpServer) Run(ctx context.Context, listen string) error {
 
 	srv := http.Server{
 		Addr:         listen,
-		Handler:      &basicauth{h: hs.mux},
+		Handler:      &basicauth{h: hs.mux, syncAPI: hs.syncMaster != nil},
 		ReadTimeout:  5 * time.Second,
 		IdleTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -121,10 +127,15 @@ func (hs *httpServer) mainServer(w http.ResponseWriter, req *http.Request) {
 }
 
 type basicauth struct {
-	h http.Handler
+	h       http.Handler
+	syncAPI bool
 }
 
 func (b *basicauth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if b.syncAPI && r.URL.Path == zonesync.Path {
+		b.h.ServeHTTP(w, r)
+		return
+	}
 
 	// cfgMutex.RLock()
 	user := appconfig.Config.HTTP.User
