@@ -161,47 +161,37 @@ single-master behavior without a DNS listener, build the controller with
 Its `-logfile` and `-checkconfig` flags work like GeoDNS's. Only one master should
 serve a given set of followers in this mode.
 
-For automatic controller failover, deploy a three-member etcd cluster on separate
-failure domains, reachable over the private WireGuard network. Each controller
-runs the standalone binary with `-mode ha`, a unique `-id`, the same `-etcd`
-endpoint list and `-etcd-prefix`, and a local config with `mode = controller`
-plus the shared token. HA controllers do not read local zone files while
-serving: etcd stores the published snapshot, and only the controller holding the
-election lease accepts node connections. The controller returns HTTP 503 until a
-snapshot is published or whenever it is not the ready leader.
-For example, start the first etcd member with the following settings, changing
-`--name`, its local IP and data directory on the other two members:
+For automatic controller failover, deploy three etcd members on separate hosts
+reachable over a private network. On each host, copy
+[`dns/etcd.ha.yml.sample`](dns/etcd.ha.yml.sample) to `/etc/geodns/etcd.yml`
+and [`dns/geodns.controller.ha.conf.sample`](dns/geodns.controller.ha.conf.sample)
+to `/etc/geodns/controller.conf`. Change the etcd member name and local IPs,
+and the controller `id` and `listen`, for each host. Keep the three-member
+`initial-cluster` list, etcd endpoints, prefix, and sync token identical.
+Give etcd a persistent, writable data directory. After editing the two files,
+start both processes on each host:
 
 ```sh
-etcd --name controller-1 --data-dir /var/lib/etcd-geodns \
-  --listen-client-urls http://10.80.0.11:2379 \
-  --advertise-client-urls http://10.80.0.11:2379 \
-  --listen-peer-urls http://10.80.0.11:2380 \
-  --initial-advertise-peer-urls http://10.80.0.11:2380 \
-  --initial-cluster controller-1=http://10.80.0.11:2380,controller-2=http://10.80.0.12:2380,controller-3=http://10.80.0.13:2380 \
-  --initial-cluster-token geodns-production --initial-cluster-state new
+etcd --config-file /etc/geodns/etcd.yml
+geodns-controller -configfile /etc/geodns/controller.conf
 ```
 
-Publish each new Zone revision from the machine holding the authoritative zone
-directory. The command checks zone files, stores the snapshot in etcd, then
-atomically makes it current:
+Run these as separate long-lived services in production. On the host holding
+the authoritative Zone directory, set `zone-directory` in `controller.conf` and
+publish the first revision with:
 
 ```sh
-geodns-controller -mode ha -publish -config /srv/geodns/zones \
-  -configfile /srv/geodns/controller/geodns.controller.conf \
-  -etcd http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379 \
-  -etcd-prefix /geodns/production
+geodns-controller -configfile /etc/geodns/controller.conf -publish
 ```
 
-Start each controller with the same etcd settings, a distinct `-id`, and its
-own private `-http` address. For example, the first controller can use:
-
-```sh
-geodns-controller -mode ha -id controller-1 -config /srv/geodns/controller \
-  -configfile geodns.controller.conf -http 10.80.0.11:8053 \
-  -etcd http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379 \
-  -etcd-prefix /geodns/production
-```
+Repeat the publish command after every Zone change. It validates the files,
+stores a complete snapshot in etcd, and atomically makes that snapshot current.
+HA controllers do not watch local Zone files while serving. Only the controller
+holding the election lease accepts node connections; others return HTTP 503.
+The controller's existing `-mode`, `-id`, `-http`, `-config`, `-etcd`, and
+`-etcd-*` flags remain available and override the corresponding config entries
+when explicitly provided. Relative paths in `[controller]` resolve from the
+controller config file's directory.
 
 On each PoP, use the
 [`dns/geodns.follower.ha.conf.sample`](dns/geodns.follower.ha.conf.sample)

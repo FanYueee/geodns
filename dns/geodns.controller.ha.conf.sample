@@ -1,0 +1,21 @@
+; Copy to each controller host. Change id and listen for that host.
+; Keep the sync token and etcd settings identical on all three hosts.
+
+[sync]
+mode = controller
+token = replace-with-the-same-long-random-secret
+
+[controller]
+mode = ha
+id = controller-1
+listen = 10.80.0.11:8053
+etcd-endpoints = http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379
+etcd-prefix = /geodns/production
+; Only the publishing host needs this directory. Relative paths use this file's directory.
+zone-directory = /srv/geodns/zones
+; Optional authenticated etcd connection:
+; etcd-user = geodns
+; etcd-password-file = /etc/geodns/etcd-password
+; etcd-ca = /etc/geodns/etcd-ca.pem
+; etcd-cert = /etc/geodns/etcd-client.pem
+; etcd-key = /etc/geodns/etcd-client-key.pem

@@ -38,8 +38,9 @@ type AppConfig struct {
 	Health struct {
 		Directory string
 	}
-	Sync     SyncConfig
-	Nodeping struct {
+	Sync       SyncConfig
+	Controller ControllerConfig
+	Nodeping   struct {
 		Token string
 	}
 	Pingdom struct {
@@ -59,6 +60,20 @@ type SyncConfig struct {
 	Token    string
 	ID       string
 	Interval string
+}
+
+type ControllerConfig struct {
+	Mode             string
+	ID               string
+	Listen           string
+	ZoneDirectory    string `gcfg:"zone-directory"`
+	EtcdEndpoints    string `gcfg:"etcd-endpoints"`
+	EtcdPrefix       string `gcfg:"etcd-prefix"`
+	EtcdUser         string `gcfg:"etcd-user"`
+	EtcdPasswordFile string `gcfg:"etcd-password-file"`
+	EtcdCA           string `gcfg:"etcd-ca"`
+	EtcdCert         string `gcfg:"etcd-cert"`
+	EtcdKey          string `gcfg:"etcd-key"`
 }
 
 // Singleton to keep the latest read config

@@ -25,7 +25,7 @@ import (
 
 func main() {
 	configDir := flag.String("config", "./dns/", "directory of zone files")
-	configFile := flag.String("configfile", "geodns.conf", "configuration file in -config directory")
+	configFile := flag.String("configfile", "geodns.conf", "configuration file path (relative to -config unless absolute)")
 	listen := flag.String("http", ":8053", "sync HTTP listen address")
 	mode := flag.String("mode", "single", "controller mode: single or ha")
 	etcdEndpoints := flag.String("etcd", "", "comma-separated etcd endpoints for HA mode")
@@ -52,44 +52,52 @@ func main() {
 	if err := appconfig.ConfigReader(name); err != nil {
 		log.Fatal(err)
 	}
+	setFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	opts := controllerOptions{
+		mode: *mode, listen: *listen, zoneDir: *configDir, id: *id,
+		etcdEndpoints: *etcdEndpoints, etcdPrefix: *etcdPrefix, etcdUser: *etcdUser,
+		etcdPasswordFile: *etcdPasswordFile, etcdCA: *etcdCA, etcdCert: *etcdCert, etcdKey: *etcdKey,
+	}
+	opts.applyConfig(appconfig.Config.Controller, name, setFlags)
 	configuredMode := appconfig.Config.Sync.Mode
-	if configuredMode != "controller" && !(*mode == "single" && configuredMode == "master") {
+	if configuredMode != "controller" && !(opts.mode == "single" && configuredMode == "master") {
 		log.Fatal("controller requires [sync] mode = controller (single mode also accepts master)")
 	}
-	switch *mode {
+	switch opts.mode {
 	case "single":
-		if *publish || *etcdEndpoints != "" {
+		if *publish || opts.etcdEndpoints != "" {
 			log.Fatal("-publish and -etcd require -mode ha")
 		}
-		master, err := zonesync.NewMaster(*configDir, appconfig.Config.Sync.Token)
+		master, err := zonesync.NewMaster(opts.zoneDir, appconfig.Config.Sync.Token)
 		if err != nil {
 			log.Fatal(err)
 		}
 		if *checkConfig {
 			return
 		}
-		serve(master, master.Run, *listen)
+		serve(master, master.Run, opts.listen)
 	case "ha":
-		if *etcdEndpoints == "" {
-			log.Fatal("-etcd is required in HA mode")
+		if opts.etcdEndpoints == "" {
+			log.Fatal("etcd endpoints are required in HA mode (set [controller] etcd-endpoints or -etcd)")
 		}
-		endpoints := strings.Split(*etcdEndpoints, ",")
+		endpoints := strings.Split(opts.etcdEndpoints, ",")
 		for i := range endpoints {
 			endpoints[i] = strings.TrimSpace(endpoints[i])
 			if endpoints[i] == "" {
 				log.Fatal("empty etcd endpoint")
 			}
 		}
-		clientConfig := clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second, Username: *etcdUser}
-		if *etcdPasswordFile != "" {
-			password, err := os.ReadFile(*etcdPasswordFile)
+		clientConfig := clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second, Username: opts.etcdUser}
+		if opts.etcdPasswordFile != "" {
+			password, err := os.ReadFile(opts.etcdPasswordFile)
 			if err != nil {
 				log.Fatal(err)
 			}
 			clientConfig.Password = strings.TrimSpace(string(password))
 		}
-		if *etcdCA != "" || *etcdCert != "" || *etcdKey != "" {
-			tlsConfig, err := etcdTLS(*etcdCA, *etcdCert, *etcdKey)
+		if opts.etcdCA != "" || opts.etcdCert != "" || opts.etcdKey != "" {
+			tlsConfig, err := etcdTLS(opts.etcdCA, opts.etcdCert, opts.etcdKey)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -100,7 +108,7 @@ func main() {
 			log.Fatal(err)
 		}
 		defer client.Close()
-		store, err := zonesync.NewStore(client, *etcdPrefix)
+		store, err := zonesync.NewStore(client, opts.etcdPrefix)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -110,24 +118,55 @@ func main() {
 			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			revision, err := store.Publish(ctx, *configDir)
+			revision, err := store.Publish(ctx, opts.zoneDir)
 			if err != nil {
 				log.Fatal(err)
 			}
 			fmt.Println(revision)
 			return
 		}
-		cluster, err := zonesync.NewCluster(store, *id, appconfig.Config.Sync.Token)
+		cluster, err := zonesync.NewCluster(store, opts.id, appconfig.Config.Sync.Token)
 		if err != nil {
 			log.Fatal(err)
 		}
 		if *checkConfig {
 			return
 		}
-		serve(cluster, cluster.Run, *listen)
+		serve(cluster, cluster.Run, opts.listen)
 	default:
-		log.Fatalf("unknown controller mode %q", *mode)
+		log.Fatalf("unknown controller mode %q", opts.mode)
 	}
+}
+
+type controllerOptions struct {
+	mode, listen, zoneDir, id                   string
+	etcdEndpoints, etcdPrefix, etcdUser         string
+	etcdPasswordFile, etcdCA, etcdCert, etcdKey string
+}
+
+func (o *controllerOptions) applyConfig(c appconfig.ControllerConfig, configFile string, setFlags map[string]bool) {
+	choose := func(flagName string, target *string, value string) {
+		if !setFlags[flagName] && value != "" {
+			*target = value
+		}
+	}
+	configPath := func(value string) string {
+		if value == "" || filepath.IsAbs(value) {
+			return value
+		}
+		return filepath.Join(filepath.Dir(configFile), value)
+	}
+	choose("mode", &o.mode, c.Mode)
+	choose("http", &o.listen, c.Listen)
+	choose("config", &o.zoneDir, configPath(c.ZoneDirectory))
+	choose("id", &o.id, c.ID)
+	choose("etcd", &o.etcdEndpoints, c.EtcdEndpoints)
+	choose("etcd-prefix", &o.etcdPrefix, c.EtcdPrefix)
+	choose("etcd-user", &o.etcdUser, c.EtcdUser)
+	choose("etcd-password-file", &o.etcdPasswordFile, configPath(c.EtcdPasswordFile))
+	choose("etcd-ca", &o.etcdCA, configPath(c.EtcdCA))
+	choose("etcd-cert", &o.etcdCert, configPath(c.EtcdCert))
+	choose("etcd-key", &o.etcdKey, configPath(c.EtcdKey))
 }
 
 type syncHandler interface {
