@@ -201,8 +201,24 @@ wins. Empty or invalid source directories are rejected and logged. Once a
 snapshot exists, restarts use cluster data even if the local source is stale or
 missing. No initial `-publish` command is required.
 
-For later changes, edit the source files and publish explicitly with the same
-binary and config from any host that can reach etcd:
+For later changes, save the Zone JSON files in that node's `source-zones/`
+directory. The running HA node watches this directory, waits 500 ms for a burst
+of edits to settle, validates the complete snapshot, and automatically publishes
+it to etcd. The elected controller then pushes the update to every connected
+node, which reloads DNS without restarting. This works even when the editing
+node is not the elected controller. Invalid files or unavailable etcd are logged
+and retried; the last published zones remain active. Local scans every five
+seconds recover missed file events; nodes still receive updates by WebSocket,
+not by polling snapshots. Adding, replacing, and removing individual Zone files
+are supported. An empty source directory is not automatically published; use
+`-publish` explicitly if you intend to remove all zones.
+
+Keep `zone-directory` on one editing node to avoid competing local sources.
+Its startup files establish a local change baseline: unchanged stale files never
+overwrite existing cluster data, including after another host publishes.
+Edits made while GeoDNS is stopped are not automatically published on restart
+when the cluster already contains zones; use the explicit command in that case.
+The same binary and config can still publish manually from a host reaching etcd:
 
 ```sh
 geodns -config /srv/geodns/node -publish
@@ -210,7 +226,6 @@ geodns -config /srv/geodns/node -publish
 
 The publish command validates the files,
 stores a complete snapshot in etcd, and atomically makes that snapshot current.
-The HA mode does not watch the authoritative Zone directory while serving.
 Only the controller holding the election lease accepts node connections;
 others return HTTP 503. Run etcd and GeoDNS as separate long-lived services
 in production.

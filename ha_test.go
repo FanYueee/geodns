@@ -243,8 +243,5 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourceDir, "example.com.json"), updated, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := publishHANode(ctx, cfg, filepath.Join(nodeDir, "geodns.conf")); err != nil {
-		t.Fatal(err)
-	}
 	waitAnswer("192.0.2.2")
 }

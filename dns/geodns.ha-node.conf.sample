@@ -16,8 +16,8 @@ listen = 10.80.0.11:8053
 ; advertise = https://pop-1.example.net
 etcd-endpoints = http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379
 etcd-prefix = /geodns/production
-; On one initial node, set this directory and put your zone JSON there before startup.
-; Startup imports it only when etcd has no zones yet. Later updates use -publish.
+; On one editing node, set this directory and put your zone JSON there before startup.
+; Startup imports it only when etcd has no zones yet. Later edits publish automatically.
 ; zone-directory = source-zones
 ; Optional authenticated etcd connection:
 ; etcd-user = geodns

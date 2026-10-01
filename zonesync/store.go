@@ -162,7 +162,7 @@ func (s *Store) loadCurrent(ctx context.Context) (snapshot, int64, error) {
 
 // Publish stores a complete snapshot and atomically switches the active revision.
 func (s *Store) Publish(ctx context.Context, dir string) (string, error) {
-	return s.publish(ctx, dir, false)
+	return s.publish(ctx, dir, false, false)
 }
 
 // Bootstrap imports local zones only when the cluster has no published snapshot.
@@ -174,10 +174,10 @@ func (s *Store) Bootstrap(ctx context.Context, dir string) (string, error) {
 	if !errors.Is(err, ErrNoSnapshot) {
 		return "", err
 	}
-	return s.publish(ctx, dir, true)
+	return s.publish(ctx, dir, true, true)
 }
 
-func (s *Store) publish(ctx context.Context, dir string, bootstrap bool) (string, error) {
+func (s *Store) publish(ctx context.Context, dir string, bootstrap, requireZones bool) (string, error) {
 	session, err := concurrency.NewSession(s.client, concurrency.WithTTL(30), concurrency.WithContext(ctx))
 	if err != nil {
 		return "", err
@@ -205,8 +205,8 @@ func (s *Store) publish(ctx context.Context, dir string, bootstrap bool) (string
 	if err != nil {
 		return "", err
 	}
-	if bootstrap && len(snapshot.Zones) == 0 {
-		return "", errors.New("bootstrap zone directory has no zone JSON files")
+	if requireZones && len(snapshot.Zones) == 0 {
+		return "", errors.New("source zone directory has no zone JSON files")
 	}
 	for name := range snapshot.Zones {
 		zone := zones.NewZone(strings.TrimSuffix(name, filepath.Ext(name)))

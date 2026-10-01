@@ -108,15 +108,11 @@ func (n *haNode) Run(ctx context.Context) error {
 	if n.bootstrapDir != "" {
 		g.Go(func() error {
 			for ctx.Err() == nil {
-				revision, err := n.store.Bootstrap(ctx, n.bootstrapDir)
-				if err == nil {
-					log.Printf("zone sync: bootstrap ready; cluster revision %s", revision)
-					return nil
-				}
+				err := n.store.WatchSource(ctx, n.bootstrapDir)
 				if ctx.Err() != nil {
 					return nil
 				}
-				log.Printf("zone sync: bootstrap failed: %s", err)
+				log.Printf("zone sync: source watcher stopped: %v; retrying", err)
 				select {
 				case <-ctx.Done():
 					return nil
