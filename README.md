@@ -189,6 +189,7 @@ listen = 10.80.0.11
 [cluster]
 enabled = true
 id = pop-1
+weight = 300
 address = 10.80.0.11
 token = replace-with-the-same-long-random-secret
 members = pop-1=10.80.0.11,pop-2=10.80.0.12,pop-3=10.80.0.13
@@ -197,6 +198,21 @@ zone-directory = source-zones
 
 On the second and third hosts, change `id`, `address`, and `[dns] listen` to that
 host's values; keep `members` and `token` identical and omit `zone-directory`.
+Set `weight` to `200` on the second host and `100` on the third to prefer
+`pop-1`, then `pop-2`, then `pop-3` as controller. Higher weights take precedence:
+if `pop-1` goes offline, `pop-2` takes over; when `pop-1` rejoins the election,
+the current controller closes its sync streams and yields automatically. Nodes
+reconnect to the new controller and keep answering DNS from their local Zones.
+Weights are nonnegative integers and default to `0`. Equal weights keep the
+existing controller, so deployments without weights retain their previous
+election behavior. Weight changes require restarting that node; Zone file edits
+remain live. This controls the **GeoDNS master**, not etcd's internal Raft leader
+or DNS record weights, and still requires etcd quorum. For external etcd HA or
+the separate controller binary, set `weight` in `[controller]` instead.
+Upgrade all controller candidates before relying on priority: older binaries
+do not participate in priority handoff. Candidate registration, election weights,
+handoff targets, and leadership endings are recorded in the logs.
+
 `address` binds embedded etcd and the sync API to this node's private IP. DNS
 `listen` may instead list public addresses, e.g.
 `23.160.172.53,2602:f37b:53::53`. Put initial Zone JSON files in the first host's

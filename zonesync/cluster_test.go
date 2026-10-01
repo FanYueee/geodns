@@ -337,6 +337,12 @@ func TestClusterLeaseExpiresAfterControllerLosesEtcd(t *testing.T) {
 	}
 	first.leaseTTL = 3
 	second.leaseTTL = 3
+	if err := first.SetWeight(300); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.SetWeight(200); err != nil {
+		t.Fatal(err)
+	}
 	firstHTTP := httptest.NewServer(http.HandlerFunc(first.ServeNodes))
 	defer firstHTTP.Close()
 	secondHTTP := httptest.NewServer(http.HandlerFunc(second.ServeNodes))

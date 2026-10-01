@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -21,14 +22,26 @@ type Cluster struct {
 	id        string
 	token     string
 	leaseTTL  int
+	weight    int
 	mu        sync.RWMutex
 	master    *Master
 	advertise string
 }
 
 type controllerAddress struct {
-	ID  string `json:"id"`
-	URL string `json:"url"`
+	ID     string `json:"id"`
+	URL    string `json:"url"`
+	Weight int    `json:"weight,omitempty"`
+}
+
+// SetWeight configures controller priority before Run starts. Equal weights
+// retain the existing leader; only a strictly higher weight preempts it.
+func (c *Cluster) SetWeight(weight int) error {
+	if weight < 0 {
+		return errors.New("controller weight must be zero or greater")
+	}
+	c.weight = weight
+	return nil
 }
 
 // SetAdvertiseURL configures discovery before Run starts.
@@ -81,7 +94,7 @@ func NewCluster(store *Store, id, token string) (*Cluster, error) {
 func (c *Cluster) Run(ctx context.Context) error {
 	value := c.id
 	if c.advertise != "" {
-		data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise})
+		data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: c.weight})
 		if err != nil {
 			return err
 		}
@@ -97,53 +110,145 @@ func (c *Cluster) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		election := concurrency.NewElection(session, c.store.prefix+"/election")
-		if err := election.Campaign(ctx, value); err != nil {
-			session.Close()
-			if ctx.Err() != nil {
-				break
-			}
-			log.Printf("zone sync: controller %q election failed: %s", c.id, err)
-			if !retryCluster(ctx) {
-				break
-			}
-			continue
-		}
-		log.Printf("zone sync: controller %q elected leader (term %d)", c.id, election.Rev())
-		leaderCtx, cancel := context.WithCancel(ctx)
+		sessionCtx, cancel := context.WithCancel(ctx)
 		leaseDone := make(chan struct{})
 		go func() {
 			defer close(leaseDone)
 			select {
 			case <-session.Done():
 				cancel()
-			case <-leaderCtx.Done():
+			case <-sessionCtx.Done():
 			}
 		}()
-		c.runLeader(leaderCtx, election.Key(), session.Lease())
+		err = c.runCandidate(sessionCtx, session, value)
 		cancel()
 		<-leaseDone
 		c.demote()
-		leaseLost := false
-		select {
-		case <-session.Done():
-			leaseLost = true
-		default:
+		// Session.Close would revoke using the canceled process context on a
+		// graceful shutdown, leaving priority registration until TTL expiry.
+		// Stop keepalives, then revoke with the client's independent context.
+		session.Orphan()
+		revokeCtx, stopRevoke := context.WithTimeout(c.store.client.Ctx(), 2*time.Second)
+		_, revokeErr := c.store.client.Revoke(revokeCtx, session.Lease())
+		stopRevoke()
+		if revokeErr != nil && ctx.Err() == nil {
+			log.Printf("zone sync: controller %q could not revoke election lease; waiting for expiry: %s", c.id, revokeErr)
 		}
-		if !leaseLost || ctx.Err() != nil {
-			resignCtx, stopResign := context.WithTimeout(c.store.client.Ctx(), 2*time.Second)
-			if err := election.Resign(resignCtx); err != nil && ctx.Err() == nil {
-				log.Printf("zone sync: controller %q could not resign leadership: %s", c.id, err)
-			}
-			stopResign()
+		if err != nil && ctx.Err() == nil {
+			log.Printf("zone sync: controller %q election session ended: %s", c.id, err)
 		}
-		session.Close()
-		log.Printf("zone sync: controller %q leadership ended", c.id)
 		if !retryCluster(ctx) {
 			break
 		}
 	}
 	return nil
+}
+
+// A candidacy lasts for the session, including while waiting or handing off.
+// Keeping it on the same lease prevents low-weight nodes from reclaiming the
+// election between a high-weight node's registration and its Campaign.
+func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session, value string) error {
+	data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: c.weight})
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s/candidates/%x", c.store.prefix, session.Lease())
+	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_, err = c.store.client.Put(requestCtx, key, string(data), clientv3.WithLease(session.Lease()))
+	cancel()
+	if err != nil {
+		return err
+	}
+	log.Printf("zone sync: controller %q joined election with weight %d", c.id, c.weight)
+	for ctx.Err() == nil {
+		if err := c.waitPreference(ctx, true); err != nil {
+			return err
+		}
+		termCtx, stopTerm := context.WithCancel(ctx)
+		preferenceDone := make(chan error, 1)
+		go func() {
+			// Fail closed if the candidate watch cannot be maintained.
+			err := c.waitPreference(termCtx, false)
+			stopTerm()
+			preferenceDone <- err
+		}()
+		election := concurrency.NewElection(session, c.store.prefix+"/election")
+		err := election.Campaign(termCtx, value)
+		if err == nil && termCtx.Err() == nil {
+			log.Printf("zone sync: controller %q elected leader (weight %d, term %d)", c.id, c.weight, election.Rev())
+			c.runLeader(termCtx, election.Key(), session.Lease())
+		}
+		stopTerm()
+		watchErr := <-preferenceDone
+		// Stop serving and close streams BEFORE releasing the election key.
+		c.demote()
+		resignCtx, stopResign := context.WithTimeout(c.store.client.Ctx(), 2*time.Second)
+		resignErr := election.Resign(resignCtx)
+		stopResign()
+		if resignErr != nil && ctx.Err() == nil {
+			return fmt.Errorf("resigning election: %w", resignErr)
+		}
+		log.Printf("zone sync: controller %q leadership or pending campaign ended", c.id)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
+			return watchErr
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// Use a linearizable read followed by a revision-based watch, so candidate
+// arrival and lease expiry cannot be missed between checking and waiting.
+func (c *Cluster) waitPreference(ctx context.Context, preferred bool) error {
+	prefix := c.store.prefix + "/candidates/"
+	for ctx.Err() == nil {
+		requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, err := c.store.client.Get(requestCtx, prefix, clientv3.WithPrefix())
+		cancel()
+		if err != nil {
+			return err
+		}
+		var higher *controllerAddress
+		for _, kv := range resp.Kvs {
+			var candidate controllerAddress
+			if err := json.Unmarshal(kv.Value, &candidate); err != nil || !validNodeID(candidate.ID) || candidate.Weight < 0 || kv.Lease == 0 {
+				return errors.New("invalid leased controller candidate")
+			}
+			if candidate.Weight > c.weight && (higher == nil || candidate.Weight > higher.Weight) {
+				higher = &candidate
+			}
+		}
+		if (higher == nil) == preferred {
+			if higher != nil {
+				log.Printf("zone sync: controller %q (weight %d) yielding election to %q (weight %d)", c.id, c.weight, higher.ID, higher.Weight)
+			}
+			return nil
+		}
+		watchCtx, cancelWatch := context.WithCancel(ctx)
+		watch := c.store.client.Watch(clientv3.WithRequireLeader(watchCtx), prefix, clientv3.WithPrefix(), clientv3.WithRev(resp.Header.Revision+1))
+		select {
+		case <-ctx.Done():
+			cancelWatch()
+			return ctx.Err()
+		case response, ok := <-watch:
+			cancelWatch()
+			if !ok {
+				return errors.New("controller candidate watch closed")
+			}
+			if err := response.Err(); err != nil {
+				// Compaction is recovered with a fresh linearizable read.
+				if response.CompactRevision == 0 {
+					return err
+				}
+			}
+		}
+	}
+	return ctx.Err()
 }
 
 func retryCluster(ctx context.Context) bool {

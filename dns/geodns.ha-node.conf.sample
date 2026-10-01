@@ -11,6 +11,9 @@ id = pop-1
 token = replace-with-the-same-long-random-secret
 
 [controller]
+; Optional master priority. Higher wins and reclaims leadership on recovery.
+; Equal weights (default 0) keep the current master. Changes require restart.
+; weight = 300
 listen = 10.80.0.11:8053
 ; Optional when the externally reachable address differs from listen:
 ; advertise = https://pop-1.example.net

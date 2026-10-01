@@ -101,6 +101,10 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		store.Close()
 		return nil, err
 	}
+	if err := cluster.SetWeight(controller.Weight); err != nil {
+		store.Close()
+		return nil, err
+	}
 	advertise := controller.Advertise
 	if advertise == "" {
 		advertise = "http://" + httpAddr

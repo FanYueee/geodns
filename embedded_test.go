@@ -27,6 +27,7 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 		t.Fatalf("embedded sample: %v", err)
 	}
 	cfg.Cluster.ZoneDirectory = "source-zones"
+	cfg.Cluster.Weight = 300
 	resolved, node, err := embeddedConfig(cfg, "dns/geodns.conf")
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +35,9 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 	wantSource, _ := filepath.Abs("dns/source-zones")
 	if resolved.Controller.ResolvePaths("dns/geodns.conf").ZoneDirectory != wantSource || !filepath.IsAbs(node.config.Dir) {
 		t.Fatalf("relative paths resolved incorrectly: %+v %s", resolved.Controller, node.config.Dir)
+	}
+	if resolved.Controller.Weight != 300 {
+		t.Fatalf("cluster weight was not passed to controller: %d", resolved.Controller.Weight)
 	}
 	for _, tc := range []struct {
 		name string
@@ -48,6 +52,7 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 		{"mixed legacy config", func(c *appconfig.AppConfig) { c.Sync.Mode = "ha" }},
 		{"port conflict", func(c *appconfig.AppConfig) { c.Cluster.ClientPort = 2380 }},
 		{"invalid name", func(c *appconfig.AppConfig) { c.Cluster.Name = "../other" }},
+		{"negative weight", func(c *appconfig.AppConfig) { c.Cluster.Weight = -1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			copy := cfg
@@ -145,6 +150,7 @@ func TestEmbeddedClusterSyncJoinRemoveFailoverAndRestart(t *testing.T) {
 	config := func(i int) appconfig.AppConfig {
 		return appconfig.AppConfig{Cluster: appconfig.ClusterConfig{
 			Enabled: true, ID: "node-" + strconv.Itoa(i+1), Address: addresses[i],
+			Weight:  300 - i*100,
 			Members: members, Token: "secret", Name: "embedded-test", ClientPort: clientPort, PeerPort: peerPort,
 		}}
 	}
@@ -275,11 +281,14 @@ func TestEmbeddedClusterSyncJoinRemoveFailoverAndRestart(t *testing.T) {
 	if leaderIndex < 0 {
 		t.Fatalf("unknown leader %s", leaderURL)
 	}
+	if leaderIndex != 0 {
+		t.Fatalf("highest-weight node did not lead: %s", leaderURL)
+	}
 	nodes[leaderIndex].stop()
 	remaining := nodes[(leaderIndex+1)%3]
 	wait(func() bool {
 		url, err := remaining.ha.store.LeaderURL(context.Background())
-		return err == nil && url != leaderURL
+		return err == nil && url == remaining.url
 	})
 	updates := t.TempDir()
 	if err := os.WriteFile(filepath.Join(updates, "example.com.json"), zone("192.0.2.3"), 0644); err != nil {
@@ -297,6 +306,18 @@ func TestEmbeddedClusterSyncJoinRemoveFailoverAndRestart(t *testing.T) {
 	restarted := start(nodes[leaderIndex].cfg, nodes[leaderIndex].dir)
 	waitLocalReady(restarted)
 	waitSync(restarted, "192.0.2.3")
+	// Recovery reclaims controller leadership while keeping the original WAL.
+	wait(func() bool {
+		url, err := remaining.ha.store.LeaderURL(context.Background())
+		return err == nil && url == restarted.url
+	})
+	writeSource("192.0.2.4")
+	waitSync(restarted, "192.0.2.4")
+	for i, node := range nodes {
+		if i != leaderIndex {
+			waitSync(node, "192.0.2.4")
+		}
+	}
 	response, err = client.MemberList(context.Background())
 	if err != nil || len(response.Members) != 3 {
 		t.Fatalf("restart changed cluster membership: %v %v", response, err)

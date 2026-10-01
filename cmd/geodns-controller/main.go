@@ -100,6 +100,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		if err := cluster.SetWeight(appconfig.Config.Controller.Weight); err != nil {
+			log.Fatal(err)
+		}
 		advertise := appconfig.Config.Controller.Advertise
 		if advertise == "" {
 			advertise = "http://" + opts.listen

@@ -75,6 +75,9 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 	if !validClusterID(c.ID) || c.Token == "" {
 		return cfg, nil, errors.New("[cluster] requires a unique id and shared token")
 	}
+	if c.Weight < 0 {
+		return cfg, nil, errors.New("cluster weight must be zero or greater")
+	}
 	address, err := clusterIP(c.Address)
 	if err != nil {
 		return cfg, nil, err
@@ -170,6 +173,7 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 	}
 	cfg.Sync = appconfig.SyncConfig{Mode: "ha", ID: c.ID, Token: c.Token}
 	cfg.Controller = appconfig.ControllerConfig{
+		Weight:        c.Weight,
 		Listen:        net.JoinHostPort(address, strconv.Itoa(c.SyncPort)),
 		ZoneDirectory: c.ZoneDirectory, EtcdEndpoints: strings.Join(n.seeds, ","),
 		EtcdPrefix: "/geodns/" + c.Name,

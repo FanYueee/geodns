@@ -8,6 +8,9 @@ token = replace-with-the-same-long-random-secret
 [controller]
 mode = ha
 id = controller-1
+; Optional master priority; higher wins and reclaims leadership on recovery.
+; Equal weights (default 0) keep the current master. Changes require restart.
+; weight = 300
 listen = 10.80.0.11:8053
 ; Optional discovery address when listen is a wildcard or behind a reverse proxy:
 ; advertise = https://controller-1.example.net

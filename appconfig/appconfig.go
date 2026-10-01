@@ -61,6 +61,7 @@ type AppConfig struct {
 type ClusterConfig struct {
 	Enabled       bool
 	ID            string
+	Weight        int
 	Address       string
 	Members       string
 	Join          string
@@ -85,6 +86,7 @@ type SyncConfig struct {
 type ControllerConfig struct {
 	Mode             string
 	ID               string
+	Weight           int
 	Listen           string
 	Advertise        string
 	ZoneDirectory    string `gcfg:"zone-directory"`
