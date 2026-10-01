@@ -31,7 +31,7 @@ func TestHANodeConfigSample(t *testing.T) {
 	if err := gcfg.ReadFileInto(&cfg, "dns/geodns.ha-node.conf.sample"); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Sync.Mode != "ha" || cfg.Sync.ID == "" || cfg.Sync.URLs == "" || cfg.Sync.Token == "" || cfg.Controller.Listen == "" || cfg.Controller.EtcdEndpoints == "" {
+	if cfg.Sync.Mode != "ha" || cfg.Sync.ID == "" || cfg.Sync.URLs != "" || cfg.Sync.Token == "" || cfg.Controller.Listen == "" || cfg.Controller.EtcdEndpoints == "" {
 		t.Fatalf("incomplete HA node sample: sync=%+v controller=%+v", cfg.Sync, cfg.Controller)
 	}
 	if _, err := publishHANode(context.Background(), cfg, "dns/geodns.ha-node.conf.sample"); err == nil || !strings.Contains(err.Error(), "zone-directory") {
@@ -48,6 +48,42 @@ func TestHANodeKeepsAuthoritativeZonesSeparate(t *testing.T) {
 	cfg.Controller.ZoneDirectory = dir
 	if _, err := newHANode(cfg, dir, filepath.Join(dir, "geodns.conf"), ":8053", false); err == nil || !strings.Contains(err.Error(), "must differ") {
 		t.Fatalf("shared source and cache directory: %v", err)
+	}
+}
+
+func TestHANodeDiscoveryAndLegacyConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		listen    string
+		advertise string
+		urls      string
+		wantError bool
+	}{
+		{name: "automatic", listen: "127.0.0.1:8053"},
+		{name: "wildcard needs address", listen: ":8053", wantError: true},
+		{name: "wildcard with proxy", listen: ":8053", advertise: "https://node.example.com"},
+		{name: "legacy list", listen: ":8053", urls: "http://127.0.0.1:8053"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := appconfig.AppConfig{}
+			cfg.Sync.Mode, cfg.Sync.ID, cfg.Sync.Token = "ha", "node-1", "secret"
+			cfg.Sync.URLs = tc.urls
+			cfg.Controller.Listen, cfg.Controller.Advertise = tc.listen, tc.advertise
+			cfg.Controller.EtcdEndpoints = "http://127.0.0.1:2379"
+			dir := t.TempDir()
+			node, err := newHANode(cfg, dir, filepath.Join(dir, "geodns.conf"), ":8053", false)
+			if tc.wantError {
+				if err == nil {
+					node.store.Close()
+					t.Fatal("invalid listen address accepted without an advertise address")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer node.store.Close()
+		})
 	}
 }
 
@@ -93,7 +129,6 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	cfg := appconfig.AppConfig{}
 	cfg.Sync.Mode = "ha"
 	cfg.Sync.ID = "node-1"
-	cfg.Sync.URLs = "http://" + httpServer.Listener.Addr().String()
 	cfg.Sync.Token = "secret"
 	cfg.Controller.Mode = "ha"
 	cfg.Controller.Listen = httpServer.Listener.Addr().String()
@@ -127,7 +162,7 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	controllerDone := make(chan error, 1)
 	followerDone := make(chan struct{})
 	muxDone := make(chan struct{})
-	go func() { controllerDone <- node.controller.Run(ctx) }()
+	go func() { controllerDone <- node.Run(ctx) }()
 	go func() {
 		mux.Run(ctx)
 		close(muxDone)
@@ -144,9 +179,6 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 			t.Errorf("controller stopped: %s", err)
 		}
 	}()
-	if _, err := publishHANode(ctx, cfg, filepath.Join(nodeDir, "geodns.conf")); err != nil {
-		t.Fatal(err)
-	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		data, err := os.ReadFile(filepath.Join(nodeDir, "example.com.json"))

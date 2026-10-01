@@ -1,5 +1,6 @@
 ; Run one geodns process per host for DNS, sync, and controller election.
 ; Put this file in the node's -config directory with no hand-managed zone JSON.
+; Change only id and listen when adding another node. Share token and etcd settings.
 
 [dns]
 detailedmetrics = true
@@ -7,16 +8,17 @@ detailedmetrics = true
 [sync]
 mode = ha
 id = pop-1
-urls = http://10.80.0.11:8053,http://10.80.0.12:8053,http://10.80.0.13:8053
 token = replace-with-the-same-long-random-secret
 
 [controller]
-mode = ha
 listen = 10.80.0.11:8053
+; Optional when the externally reachable address differs from listen:
+; advertise = https://pop-1.example.net
 etcd-endpoints = http://10.80.0.11:2379,http://10.80.0.12:2379,http://10.80.0.13:2379
 etcd-prefix = /geodns/production
-; Only the publishing host needs a separate directory of authoritative zones.
-; zone-directory = /srv/geodns/source-zones
+; On one initial node, set this directory and put your zone JSON there before startup.
+; Startup imports it only when etcd has no zones yet. Later updates use -publish.
+; zone-directory = source-zones
 ; Optional authenticated etcd connection:
 ; etcd-user = geodns
 ; etcd-password-file = /etc/geodns/etcd-password

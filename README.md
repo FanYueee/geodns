@@ -171,9 +171,20 @@ data directory and start it with `etcd --config-file /etc/geodns/etcd.yml`.
 When each host also serves DNS, build only `geodns` and put a copy of
 [`dns/geodns.ha-node.conf.sample`](dns/geodns.ha-node.conf.sample) in each
 node's dedicated `-config` directory as `geodns.conf`. Use a unique `[sync] id`
-and the host's private `[controller] listen` address; keep `urls`,
-`etcd-endpoints`, `etcd-prefix`, and the token identical. Start one GeoDNS
-process per host:
+and the host's private `[controller] listen` address; keep `etcd-endpoints`,
+`etcd-prefix`, and the token identical. Every GeoDNS node serves DNS and is
+eligible for controller election, including nodes added later. No GeoDNS URL
+list is needed: each candidate advertises its own HTTP origin in its leased
+etcd election record, and nodes discover the elected candidate when connecting
+or reconnecting. Use a private, reachable address for `listen`. If listening on
+a wildcard or using an HTTPS reverse proxy, set `[controller] advertise` to
+the reachable HTTP(S) origin instead.
+
+Before the first startup, put the initial Zone JSON files in a **separate**
+source directory on one node and set `[controller] zone-directory` there.
+For example, `zone-directory = source-zones` refers to a `source-zones/`
+subdirectory beside that node's `geodns.conf`; other nodes omit this setting.
+Start one GeoDNS process per host:
 
 ```sh
 geodns -config /srv/geodns/node
@@ -183,20 +194,35 @@ This process answers DNS, participates in controller election, and connects to
 the elected leader to receive zones, including when it is the leader. The
 private HTTP listener uses `[controller] listen`; `-http` overrides it. Keep
 the node's `-config` directory for synced zones and its local `geodns.conf`.
-On the publishing host, set `[controller] zone-directory` to a **separate**
-directory containing authoritative Zone JSON files. Publish with the same
-binary and config:
+The node with `zone-directory` automatically imports its files only when the
+cluster has no published snapshot. The import retries if etcd is not yet
+available. Concurrent initial imports are serialized; the first valid snapshot
+wins. Empty or invalid source directories are rejected and logged. Once a
+snapshot exists, restarts use cluster data even if the local source is stale or
+missing. No initial `-publish` command is required.
+
+For later changes, edit the source files and publish explicitly with the same
+binary and config from any host that can reach etcd:
 
 ```sh
 geodns -config /srv/geodns/node -publish
 ```
 
-Repeat the publish command after every Zone change. It validates the files,
+The publish command validates the files,
 stores a complete snapshot in etcd, and atomically makes that snapshot current.
 The HA mode does not watch the authoritative Zone directory while serving.
 Only the controller holding the election lease accepts node connections;
 others return HTTP 503. Run etcd and GeoDNS as separate long-lived services
 in production.
+
+To add a node, copy the HA node config, change its `id` and `listen`, provide
+the same token and etcd settings, and start `geodns`. It joins the election and
+receives the current zones without changing or restarting existing nodes.
+To remove a GeoDNS node, stop it; its election record disappears on resignation
+or lease expiry. Disconnections are logged and known offline status is retained
+for monitoring. This changes the GeoDNS node set, not etcd membership; the shared
+three-member etcd quorum can serve any number of GeoDNS election candidates.
+Adding or removing an actual etcd member still requires etcd's member management.
 
 For independent controller processes instead, copy
 [`dns/geodns.controller.ha.conf.sample`](dns/geodns.controller.ha.conf.sample)
@@ -211,6 +237,9 @@ The controller's existing `-mode`, `-id`, `-http`, `-config`, `-etcd`, and
 `-etcd-*` flags remain available and override the corresponding config entries
 when explicitly provided. Relative paths in `[controller]` resolve from the
 controller config file's directory.
+Existing `[sync] urls` lists in HA node configs continue to select the explicit
+connection path. To migrate an existing cluster to discovery, first upgrade all
+candidates and ensure each advertises a reachable address, then remove `urls`.
 
 The leader persists known node status every five seconds; a new leader
 initially marks those nodes offline until they reconnect. An abrupt controller

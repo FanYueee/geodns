@@ -339,14 +339,22 @@ func (f *Follower) Run(ctx context.Context) {
 }
 
 func (f *Follower) stream(ctx context.Context, retrying bool) (bool, error) {
+	urls := f.urls
+	if f.discover != nil {
+		origin, err := f.discover(ctx)
+		if err != nil {
+			return false, fmt.Errorf("discover leader: %w", err)
+		}
+		urls = []string{origin}
+	}
 	header := http.Header{"Authorization": []string{"Bearer " + f.token}}
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	var conn *websocket.Conn
 	var masterHost string
 	var failures []error
-	for offset := range f.urls {
-		index := (f.nextURL + offset) % len(f.urls)
-		u, err := url.Parse(f.urls[index])
+	for offset := range urls {
+		index := (f.nextURL + offset) % len(urls)
+		u, err := url.Parse(urls[index])
 		if err != nil {
 			return false, err
 		}
@@ -369,7 +377,7 @@ func (f *Follower) stream(ctx context.Context, retrying bool) (bool, error) {
 		}
 		conn = candidate
 		masterHost = u.Host
-		f.nextURL = (index + 1) % len(f.urls)
+		f.nextURL = (index + 1) % len(urls)
 		break
 	}
 	if conn == nil {

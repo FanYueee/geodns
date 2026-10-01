@@ -100,6 +100,13 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		advertise := appconfig.Config.Controller.Advertise
+		if advertise == "" {
+			advertise = "http://" + opts.listen
+		}
+		if err := cluster.SetAdvertiseURL(advertise); err != nil && appconfig.Config.Controller.Advertise != "" {
+			log.Fatal(err)
+		}
 		if *checkConfig {
 			return
 		}

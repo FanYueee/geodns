@@ -4,26 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/abh/geodns/v3/appconfig"
 	"github.com/abh/geodns/v3/zonesync"
+	"golang.org/x/sync/errgroup"
 )
 
 type haNode struct {
-	controller *zonesync.Cluster
-	follower   *zonesync.Follower
-	store      *zonesync.Store
-	httpAddr   string
+	controller   *zonesync.Cluster
+	follower     *zonesync.Follower
+	store        *zonesync.Store
+	httpAddr     string
+	bootstrapDir string
 }
 
 func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, httpExplicit bool) (*haNode, error) {
 	if cfg.Sync.Mode != "ha" {
 		return nil, errors.New("[sync] mode = ha is required")
 	}
-	if cfg.Sync.URLs == "" {
-		return nil, errors.New("HA node requires [sync] urls with controller addresses")
+	if cfg.Sync.Interval != "" {
+		return nil, errors.New("sync interval is no longer used; remove it from HA configuration")
+	}
+	if cfg.Sync.URL != "" {
+		return nil, errors.New("HA node uses automatic discovery or explicit sync urls, not url")
 	}
 	controller := cfg.Controller.ResolvePaths(configFile)
 	if controller.Mode != "" && controller.Mode != "ha" {
@@ -57,12 +64,6 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 	if httpAddr == "" {
 		return nil, errors.New("HA node requires an HTTP listener")
 	}
-	followerCfg := cfg.Sync
-	followerCfg.Mode = "follower"
-	_, follower, err := configureSync(followerCfg, zoneDir, httpAddr)
-	if err != nil {
-		return nil, err
-	}
 	store, err := dialControllerStore(controller)
 	if err != nil {
 		return nil, err
@@ -76,7 +77,56 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		store.Close()
 		return nil, err
 	}
-	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr}, nil
+	advertise := controller.Advertise
+	if advertise == "" {
+		advertise = "http://" + httpAddr
+	}
+	if err := cluster.SetAdvertiseURL(advertise); err != nil {
+		if controller.Advertise != "" || cfg.Sync.URLs == "" {
+			store.Close()
+			return nil, fmt.Errorf("invalid controller advertise address (use a reachable WG address, or set advertise): %w", err)
+		}
+	}
+	var follower *zonesync.Follower
+	if cfg.Sync.URLs == "" {
+		follower, err = zonesync.NewDiscoveredFollower(zoneDir, cfg.Sync.Token, cfg.Sync.ID, store)
+	} else {
+		followerCfg := cfg.Sync
+		followerCfg.Mode = "follower"
+		_, follower, err = configureSync(followerCfg, zoneDir, httpAddr)
+	}
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr, bootstrapDir: controller.ZoneDirectory}, nil
+}
+
+func (n *haNode) Run(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return n.controller.Run(ctx) })
+	if n.bootstrapDir != "" {
+		g.Go(func() error {
+			for ctx.Err() == nil {
+				revision, err := n.store.Bootstrap(ctx, n.bootstrapDir)
+				if err == nil {
+					log.Printf("zone sync: bootstrap ready; cluster revision %s", revision)
+					return nil
+				}
+				if ctx.Err() != nil {
+					return nil
+				}
+				log.Printf("zone sync: bootstrap failed: %s", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(5 * time.Second):
+				}
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 func dialControllerStore(c appconfig.ControllerConfig) (*zonesync.Store, error) {

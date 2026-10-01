@@ -162,24 +162,22 @@ func (s *Store) loadCurrent(ctx context.Context) (snapshot, int64, error) {
 
 // Publish stores a complete snapshot and atomically switches the active revision.
 func (s *Store) Publish(ctx context.Context, dir string) (string, error) {
-	snapshot, err := readSnapshot(dir)
-	if err != nil {
+	return s.publish(ctx, dir, false)
+}
+
+// Bootstrap imports local zones only when the cluster has no published snapshot.
+func (s *Store) Bootstrap(ctx context.Context, dir string) (string, error) {
+	meta, _, err := s.currentMetadata(ctx)
+	if err == nil {
+		return meta.Revision, nil
+	}
+	if !errors.Is(err, ErrNoSnapshot) {
 		return "", err
 	}
-	for name := range snapshot.Zones {
-		zone := zones.NewZone(strings.TrimSuffix(name, filepath.Ext(name)))
-		if err := zone.ReadZoneFile(filepath.Join(dir, name)); err != nil {
-			return "", fmt.Errorf("invalid zone %q: %w", name, err)
-		}
-	}
-	verified, err := readSnapshot(dir)
-	if err != nil || verified.Revision != snapshot.Revision {
-		return "", errors.New("zone files changed while publishing; retry")
-	}
-	data, err := json.Marshal(snapshot)
-	if err != nil || len(data) > maxStoredSnapshot {
-		return "", errors.New("zone snapshot exceeds etcd storage limit")
-	}
+	return s.publish(ctx, dir, true)
+}
+
+func (s *Store) publish(ctx context.Context, dir string, bootstrap bool) (string, error) {
 	session, err := concurrency.NewSession(s.client, concurrency.WithTTL(30), concurrency.WithContext(ctx))
 	if err != nil {
 		return "", err
@@ -200,6 +198,30 @@ func (s *Store) Publish(ctx context.Context, dir string) (string, error) {
 	if err != nil && !errors.Is(err, ErrNoSnapshot) {
 		return "", err
 	}
+	if bootstrap && err == nil {
+		return previous.Revision, nil
+	}
+	snapshot, err := readSnapshot(dir)
+	if err != nil {
+		return "", err
+	}
+	if bootstrap && len(snapshot.Zones) == 0 {
+		return "", errors.New("bootstrap zone directory has no zone JSON files")
+	}
+	for name := range snapshot.Zones {
+		zone := zones.NewZone(strings.TrimSuffix(name, filepath.Ext(name)))
+		if err := zone.ReadZoneFile(filepath.Join(dir, name)); err != nil {
+			return "", fmt.Errorf("invalid zone %q: %w", name, err)
+		}
+	}
+	verified, err := readSnapshot(dir)
+	if err != nil || verified.Revision != snapshot.Revision {
+		return "", errors.New("zone files changed while publishing; retry")
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil || len(data) > maxStoredSnapshot {
+		return "", errors.New("zone snapshot exceeds etcd storage limit")
+	}
 	if previous.Revision == snapshot.Revision {
 		return snapshot.Revision, nil
 	}
@@ -218,7 +240,11 @@ func (s *Store) Publish(ctx context.Context, dir string) (string, error) {
 		return "", err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	commit, err := s.client.Txn(requestCtx).If(mutex.IsOwner()).Then(clientv3.OpPut(s.currentKey(), string(meta))).Commit()
+	guards := []clientv3.Cmp{mutex.IsOwner()}
+	if bootstrap {
+		guards = append(guards, clientv3.Compare(clientv3.Version(s.currentKey()), "=", 0))
+	}
+	commit, err := s.client.Txn(requestCtx).If(guards...).Then(clientv3.OpPut(s.currentKey(), string(meta))).Commit()
 	cancel()
 	if err != nil {
 		return "", err

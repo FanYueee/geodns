@@ -296,7 +296,7 @@ func main() {
 		g.Go(func() error { return syncMaster.Run(ctx) })
 	}
 	if ha != nil {
-		g.Go(func() error { return ha.controller.Run(ctx) })
+		g.Go(func() error { return ha.Run(ctx) })
 	}
 
 	g.Go(func() error {

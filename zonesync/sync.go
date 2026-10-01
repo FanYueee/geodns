@@ -172,14 +172,15 @@ func zoneFile(name string) bool {
 }
 
 type Follower struct {
-	dir     string
-	url     string
-	urls    []string
-	token   string
-	id      string
-	nextURL int
-	reload  func() error
-	client  *http.Client
+	dir      string
+	url      string
+	urls     []string
+	token    string
+	id       string
+	nextURL  int
+	reload   func() error
+	client   *http.Client
+	discover func(context.Context) (string, error)
 }
 
 func NewFollower(dir, masterURL, token, id string) (*Follower, error) {
@@ -188,33 +189,69 @@ func NewFollower(dir, masterURL, token, id string) (*Follower, error) {
 
 // NewFollowerWithURLs tries each controller when the current one is unavailable.
 func NewFollowerWithURLs(dir string, masterURLs []string, token, id string) (*Follower, error) {
-	if token == "" {
-		return nil, errors.New("sync token is required for follower mode")
-	}
-	if !validNodeID(id) {
-		return nil, errors.New("sync follower id must contain 1-64 letters, digits, dots, underscores or hyphens")
+	f, err := newFollower(dir, token, id)
+	if err != nil {
+		return nil, err
 	}
 	if len(masterURLs) == 0 {
 		return nil, errors.New("at least one sync URL is required")
 	}
 	urls := make([]string, 0, len(masterURLs))
 	for _, masterURL := range masterURLs {
-		u, err := url.Parse(masterURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return nil, fmt.Errorf("sync URL must be an HTTP(S) origin: %q", masterURL)
+		if err := validateOrigin(masterURL); err != nil {
+			return nil, err
 		}
 		urls = append(urls, strings.TrimSuffix(masterURL, "/")+Path)
+	}
+	f.url, f.urls = urls[0], urls
+	return f, nil
+}
+
+func NewDiscoveredFollower(dir, token, id string, store *Store) (*Follower, error) {
+	if store == nil {
+		return nil, errors.New("etcd store is required for leader discovery")
+	}
+	f, err := newFollower(dir, token, id)
+	if err != nil {
+		return nil, err
+	}
+	f.discover = store.LeaderURL
+	return f, nil
+}
+
+func validateOrigin(origin string) error {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return fmt.Errorf("sync URL must be an HTTP(S) origin: %q", origin)
+	}
+	return nil
+}
+
+func newFollower(dir, token, id string) (*Follower, error) {
+	if token == "" {
+		return nil, errors.New("sync token is required for follower mode")
+	}
+	if !validNodeID(id) {
+		return nil, errors.New("sync follower id must contain 1-64 letters, digits, dots, underscores or hyphens")
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("sync zone directory %q is unavailable", dir)
 	}
-	return &Follower{dir: dir, url: urls[0], urls: urls, token: token, id: id, client: &http.Client{Timeout: 15 * time.Second}}, nil
+	return &Follower{dir: dir, token: token, id: id, client: &http.Client{Timeout: 15 * time.Second}}, nil
 }
 
 func (f *Follower) SetReload(fn func() error) { f.reload = fn }
 
 func (f *Follower) Pull(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
+	target := f.url
+	if f.discover != nil {
+		origin, err := f.discover(ctx)
+		if err != nil {
+			return err
+		}
+		target = strings.TrimSuffix(origin, "/") + Path
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return err
 	}

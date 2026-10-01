@@ -67,6 +67,7 @@ type ControllerConfig struct {
 	Mode             string
 	ID               string
 	Listen           string
+	Advertise        string
 	ZoneDirectory    string `gcfg:"zone-directory"`
 	EtcdEndpoints    string `gcfg:"etcd-endpoints"`
 	EtcdPrefix       string `gcfg:"etcd-prefix"`

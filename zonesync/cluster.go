@@ -2,9 +2,12 @@ package zonesync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -14,12 +17,52 @@ import (
 
 // Cluster serves sync requests only while this controller holds the etcd lease.
 type Cluster struct {
-	store    *Store
-	id       string
-	token    string
-	leaseTTL int
-	mu       sync.RWMutex
-	master   *Master
+	store     *Store
+	id        string
+	token     string
+	leaseTTL  int
+	mu        sync.RWMutex
+	master    *Master
+	advertise string
+}
+
+type controllerAddress struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
+}
+
+// SetAdvertiseURL configures discovery before Run starts.
+func (c *Cluster) SetAdvertiseURL(origin string) error {
+	if err := validateOrigin(origin); err != nil {
+		return err
+	}
+	u, _ := url.Parse(origin)
+	if ip := net.ParseIP(u.Hostname()); ip != nil && ip.IsUnspecified() {
+		return errors.New("advertise address must be reachable; a wildcard listen address cannot be advertised")
+	}
+	c.advertise = origin
+	return nil
+}
+
+// LeaderURL reads the first election candidate, whose key shares its session lease.
+func (s *Store) LeaderURL(ctx context.Context) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := s.client.Get(requestCtx, s.prefix+"/election/", clientv3.WithFirstCreate()...)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Kvs) == 0 {
+		return "", errors.New("no controller has joined the election")
+	}
+	var address controllerAddress
+	if err := json.Unmarshal(resp.Kvs[0].Value, &address); err != nil || !validNodeID(address.ID) {
+		return "", errors.New("elected controller does not advertise a discovery address; use explicit sync urls for legacy controllers")
+	}
+	if err := validateOrigin(address.URL); err != nil {
+		return "", err
+	}
+	return address.URL, nil
 }
 
 func NewCluster(store *Store, id, token string) (*Cluster, error) {
@@ -36,6 +79,14 @@ func NewCluster(store *Store, id, token string) (*Cluster, error) {
 }
 
 func (c *Cluster) Run(ctx context.Context) error {
+	value := c.id
+	if c.advertise != "" {
+		data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise})
+		if err != nil {
+			return err
+		}
+		value = string(data)
+	}
 	defer c.demote()
 	for ctx.Err() == nil {
 		session, err := concurrency.NewSession(c.store.client, concurrency.WithTTL(c.leaseTTL), concurrency.WithContext(ctx))
@@ -47,7 +98,7 @@ func (c *Cluster) Run(ctx context.Context) error {
 			continue
 		}
 		election := concurrency.NewElection(session, c.store.prefix+"/election")
-		if err := election.Campaign(ctx, c.id); err != nil {
+		if err := election.Campaign(ctx, value); err != nil {
 			session.Close()
 			if ctx.Err() != nil {
 				break
