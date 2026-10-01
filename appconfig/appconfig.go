@@ -44,6 +44,7 @@ type AppConfig struct {
 	Sync       SyncConfig
 	Controller ControllerConfig
 	Cluster    ClusterConfig
+	Node       map[string]*ClusterNodeConfig
 	Nodeping   struct {
 		Token string
 	}
@@ -65,6 +66,7 @@ type ClusterConfig struct {
 	Address       string
 	Members       string
 	Join          string
+	Bootstrap     string
 	Token         string
 	Name          string
 	DataDirectory string `gcfg:"data-directory"`
@@ -72,6 +74,14 @@ type ClusterConfig struct {
 	ClientPort    int    `gcfg:"client-port"`
 	PeerPort      int    `gcfg:"peer-port"`
 	SyncPort      int    `gcfg:"sync-port"`
+}
+
+// ClusterNodeConfig is one entry in a shared deployment configuration.
+type ClusterNodeConfig struct {
+	Address       string
+	Listen        string
+	Weight        int
+	ZoneDirectory string `gcfg:"zone-directory"`
 }
 
 type SyncConfig struct {

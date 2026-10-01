@@ -139,6 +139,9 @@ func (n *haNode) Run(ctx context.Context) error {
 		embeddedCtx, stopEmbedded = context.WithCancel(context.WithoutCancel(ctx))
 		defer stopEmbedded()
 		g.Go(func() error { return n.embedded.Run(embeddedCtx) })
+		if n.embedded.deployment != nil {
+			g.Go(func() error { return n.embedded.deployment.Run(ctx, n.controller) })
+		}
 	}
 	// Campaign's cancellation cleanup uses the client's context. Closing our
 	// owned client prevents that cleanup from waiting on a stopped local server.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -18,14 +19,16 @@ import (
 
 // Cluster serves sync requests only while this controller holds the etcd lease.
 type Cluster struct {
-	store     *Store
-	id        string
-	token     string
-	leaseTTL  int
-	weight    int
-	mu        sync.RWMutex
-	master    *Master
-	advertise string
+	store         *Store
+	id            string
+	token         string
+	leaseTTL      int
+	weight        atomic.Int64
+	weightChanged chan struct{}
+	elected       atomic.Bool
+	mu            sync.RWMutex
+	master        *Master
+	advertise     string
 }
 
 type controllerAddress struct {
@@ -34,15 +37,23 @@ type controllerAddress struct {
 	Weight int    `json:"weight,omitempty"`
 }
 
-// SetWeight configures controller priority before Run starts. Equal weights
+// SetWeight configures controller priority, including while Run is active. Equal weights
 // retain the existing leader; only a strictly higher weight preempts it.
 func (c *Cluster) SetWeight(weight int) error {
 	if weight < 0 {
 		return errors.New("controller weight must be zero or greater")
 	}
-	c.weight = weight
+	if c.weight.Swap(int64(weight)) != int64(weight) {
+		select {
+		case c.weightChanged <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
+
+// IsLeader reports ownership of the election, even before the first Zone exists.
+func (c *Cluster) IsLeader() bool { return c.elected.Load() }
 
 // SetAdvertiseURL configures discovery before Run starts.
 func (c *Cluster) SetAdvertiseURL(origin string) error {
@@ -88,20 +99,26 @@ func NewCluster(store *Store, id, token string) (*Cluster, error) {
 	if token == "" {
 		return nil, errors.New("sync token is required")
 	}
-	return &Cluster{store: store, id: id, token: token, leaseTTL: 10}, nil
+	return &Cluster{store: store, id: id, token: token, leaseTTL: 10, weightChanged: make(chan struct{}, 1)}, nil
 }
 
 func (c *Cluster) Run(ctx context.Context) error {
-	value := c.id
-	if c.advertise != "" {
-		data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: c.weight})
-		if err != nil {
-			return err
-		}
-		value = string(data)
+	select {
+	case <-c.weightChanged:
+	default:
 	}
 	defer c.demote()
+	defer c.elected.Store(false)
 	for ctx.Err() == nil {
+		weight := int(c.weight.Load())
+		value := c.id
+		if c.advertise != "" {
+			data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: weight})
+			if err != nil {
+				return err
+			}
+			value = string(data)
+		}
 		session, err := concurrency.NewSession(c.store.client, concurrency.WithTTL(c.leaseTTL), concurrency.WithContext(ctx))
 		if err != nil {
 			log.Printf("zone sync: controller %q cannot create election lease: %s", c.id, err)
@@ -117,10 +134,14 @@ func (c *Cluster) Run(ctx context.Context) error {
 			select {
 			case <-session.Done():
 				cancel()
+			case <-c.weightChanged:
+				log.Printf("zone sync: controller %q weight changed to %d; renewing election", c.id, c.weight.Load())
+				cancel()
 			case <-sessionCtx.Done():
 			}
 		}()
-		err = c.runCandidate(sessionCtx, session, value)
+		err = c.runCandidate(sessionCtx, session, value, weight)
+		c.elected.Store(false)
 		cancel()
 		<-leaseDone
 		c.demote()
@@ -147,8 +168,8 @@ func (c *Cluster) Run(ctx context.Context) error {
 // A candidacy lasts for the session, including while waiting or handing off.
 // Keeping it on the same lease prevents low-weight nodes from reclaiming the
 // election between a high-weight node's registration and its Campaign.
-func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session, value string) error {
-	data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: c.weight})
+func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session, value string, weight int) error {
+	data, err := json.Marshal(controllerAddress{ID: c.id, URL: c.advertise, Weight: weight})
 	if err != nil {
 		return err
 	}
@@ -159,27 +180,29 @@ func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session
 	if err != nil {
 		return err
 	}
-	log.Printf("zone sync: controller %q joined election with weight %d", c.id, c.weight)
+	log.Printf("zone sync: controller %q joined election with weight %d", c.id, weight)
 	for ctx.Err() == nil {
-		if err := c.waitPreference(ctx, true); err != nil {
+		if err := c.waitPreference(ctx, true, weight); err != nil {
 			return err
 		}
 		termCtx, stopTerm := context.WithCancel(ctx)
 		preferenceDone := make(chan error, 1)
 		go func() {
 			// Fail closed if the candidate watch cannot be maintained.
-			err := c.waitPreference(termCtx, false)
+			err := c.waitPreference(termCtx, false, weight)
 			stopTerm()
 			preferenceDone <- err
 		}()
 		election := concurrency.NewElection(session, c.store.prefix+"/election")
 		err := election.Campaign(termCtx, value)
 		if err == nil && termCtx.Err() == nil {
-			log.Printf("zone sync: controller %q elected leader (weight %d, term %d)", c.id, c.weight, election.Rev())
+			c.elected.Store(true)
+			log.Printf("zone sync: controller %q elected leader (weight %d, term %d)", c.id, weight, election.Rev())
 			c.runLeader(termCtx, election.Key(), session.Lease())
 		}
 		stopTerm()
 		watchErr := <-preferenceDone
+		c.elected.Store(false)
 		// Stop serving and close streams BEFORE releasing the election key.
 		c.demote()
 		resignCtx, stopResign := context.WithTimeout(c.store.client.Ctx(), 2*time.Second)
@@ -204,7 +227,7 @@ func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session
 
 // Use a linearizable read followed by a revision-based watch, so candidate
 // arrival and lease expiry cannot be missed between checking and waiting.
-func (c *Cluster) waitPreference(ctx context.Context, preferred bool) error {
+func (c *Cluster) waitPreference(ctx context.Context, preferred bool, weight int) error {
 	prefix := c.store.prefix + "/candidates/"
 	for ctx.Err() == nil {
 		requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -219,13 +242,13 @@ func (c *Cluster) waitPreference(ctx context.Context, preferred bool) error {
 			if err := json.Unmarshal(kv.Value, &candidate); err != nil || !validNodeID(candidate.ID) || candidate.Weight < 0 || kv.Lease == 0 {
 				return errors.New("invalid leased controller candidate")
 			}
-			if candidate.Weight > c.weight && (higher == nil || candidate.Weight > higher.Weight) {
+			if candidate.Weight > weight && (higher == nil || candidate.Weight > higher.Weight) {
 				higher = &candidate
 			}
 		}
 		if (higher == nil) == preferred {
 			if higher != nil {
-				log.Printf("zone sync: controller %q (weight %d) yielding election to %q (weight %d)", c.id, c.weight, higher.ID, higher.Weight)
+				log.Printf("zone sync: controller %q (weight %d) yielding election to %q (weight %d)", c.id, weight, higher.ID, higher.Weight)
 			}
 			return nil
 		}

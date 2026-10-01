@@ -1,0 +1,36 @@
+; Copy the SAME file to each host. GeoDNS identifies itself by the local WG IP.
+; Start every host: geodns -config /srv/geodns/node/geodns.conf
+; No members or join setting is needed. Keep etcd-data on persistent storage.
+
+[cluster]
+enabled = true
+token = replace-with-the-same-long-random-secret
+; This host creates the cluster on FIRST startup; keep its existing data afterward.
+bootstrap = pop-1
+
+[node "pop-1"]
+address = 10.80.0.11
+listen = 23.160.172.53,2602:f37b:53::53
+weight = 300
+zone-directory = source-zones
+
+[node "pop-2"]
+address = 10.80.0.12
+listen = 192.0.2.12,2001:db8::12
+weight = 200
+
+[node "pop-3"]
+address = 10.80.0.13
+listen = 192.0.2.13,2001:db8::13
+weight = 100
+
+; Replace listen with each host's actual public DNS IPs, and address with its WG IP.
+; Add a [node "pop-4"] entry on any running host, then copy the updated file to
+; the new machine and start it. Other running hosts receive the change via etcd.
+; Node entries and weights are watched automatically (including atomic saves).
+; To permanently remove a node, delete its section while quorum is available.
+; It is removed from etcd before its process exits. Update bootstrap too if
+; removing the named bootstrap host. DNS listen/source-directory changes need
+; restarting the affected host with the updated file; WG IP changes require a
+; replacement member. Name/token/ports are shared and require a coordinated restart.
+; Never delete the bootstrap host's data to start an existing cluster afresh.

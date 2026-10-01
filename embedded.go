@@ -24,12 +24,15 @@ import (
 )
 
 type embeddedNode struct {
-	config    *embed.Config
-	seeds     []string
-	join      bool
-	peerURL   string
-	clientURL string
-	store     *zonesync.Store
+	config     *embed.Config
+	seeds      []string
+	join       bool
+	peerURL    string
+	clientURL  string
+	store      *zonesync.Store
+	shared     bool
+	bootstrap  bool
+	deployment *sharedDeployment
 }
 
 type embeddedLogWriter struct{}
@@ -61,11 +64,16 @@ func validClusterID(id string) bool {
 }
 
 func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppConfig, *embeddedNode, error) {
+	var err error
+	cfg, err = resolveSharedConfig(cfg)
+	if err != nil {
+		return cfg, nil, err
+	}
 	c := cfg.Cluster
 	if !c.Enabled {
 		return cfg, nil, nil
 	}
-	configFile, err := filepath.Abs(configFile)
+	configFile, err = filepath.Abs(configFile)
 	if err != nil {
 		return cfg, nil, err
 	}
@@ -82,6 +90,7 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 	if err != nil {
 		return cfg, nil, err
 	}
+	c.Address = address
 	ports := []*int{&c.ClientPort, &c.PeerPort, &c.SyncPort}
 	for i, fallback := range []int{2379, 2380, 8053} {
 		if *ports[i] == 0 {
@@ -94,7 +103,7 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 	if c.ClientPort == c.PeerPort || c.ClientPort == c.SyncPort || c.PeerPort == c.SyncPort {
 		return cfg, nil, errors.New("cluster client, peer, and sync ports must differ")
 	}
-	if (c.Members == "") == (c.Join == "") {
+	if len(cfg.Node) == 0 && (c.Members == "") == (c.Join == "") {
 		return cfg, nil, errors.New("[cluster] requires either initial members or join addresses, not both")
 	}
 	if c.Name == "" {
@@ -134,7 +143,15 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 	ec.ZapLoggerBuilder = embed.NewZapLoggerBuilder(zap.New(core))
 	n := &embeddedNode{config: ec, join: c.Join != "", peerURL: peerURL, clientURL: clientURL}
 	var initial []string
-	if n.join {
+	if len(cfg.Node) != 0 {
+		n.shared, n.bootstrap = true, c.Bootstrap == c.ID
+		ec.InitialCluster = c.ID + "=" + peerURL
+		ids, _ := sharedNodeIDs(cfg)
+		for _, id := range ids {
+			ip, _ := clusterIP(cfg.Node[id].Address)
+			n.seeds = append(n.seeds, "http://"+net.JoinHostPort(ip, strconv.Itoa(c.ClientPort)))
+		}
+	} else if n.join {
 		ec.ClusterState = embed.ClusterStateFlagExisting
 		ec.InitialCluster = c.ID + "=" + peerURL
 		for _, seed := range strings.Split(c.Join, ",") {
@@ -179,12 +196,22 @@ func embeddedConfig(cfg appconfig.AppConfig, configFile string) (appconfig.AppCo
 		EtcdPrefix: "/geodns/" + c.Name,
 	}
 	cfg.Cluster = c
+	if n.shared {
+		n.deployment = &sharedDeployment{node: n, cfg: cfg, file: configFile}
+	}
 	return cfg, n, nil
 }
 
 func (n *embeddedNode) Run(ctx context.Context) error {
 	var learnerID uint64
-	if n.join {
+	if n.shared {
+		var err error
+		learnerID, err = n.prepareShared(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if n.join && !n.shared {
 		_, err := os.Stat(filepath.Join(n.config.Dir, "member", "wal"))
 		if err != nil && !os.IsNotExist(err) {
 			return err
@@ -237,6 +264,56 @@ func (n *embeddedNode) Run(ctx context.Context) error {
 	case <-e.Server.StopNotify():
 		return errors.New("embedded etcd stopped (the member may have been removed)")
 	}
+}
+
+// A shared deployment is created by one designated host. Fresh nodes probe the
+// existing store and register there; lack of connectivity never lets an ordinary
+// joining node create a second cluster.
+func (n *embeddedNode) prepareShared(ctx context.Context) (uint64, error) {
+	_, err := os.Stat(filepath.Join(n.config.Dir, "member", "wal"))
+	if err == nil {
+		n.join = true
+		n.config.ClusterState = embed.ClusterStateFlagExisting
+		return 0, nil
+	}
+	if !os.IsNotExist(err) {
+		return 0, err
+	}
+	client, err := n.client()
+	if err != nil {
+		return 0, err
+	}
+	defer client.Close()
+	for ctx.Err() == nil {
+		requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := client.MemberList(requestCtx)
+		cancel()
+		if ctx.Err() != nil {
+			return 0, nil
+		}
+		if err == nil {
+			if err := n.deployment.admit(ctx, client); err != nil {
+				return 0, err
+			}
+			n.join = true
+			n.config.ClusterState = embed.ClusterStateFlagExisting
+			id, err := n.register(ctx)
+			if err == nil {
+				log.Printf("cluster: shared node %q automatically joined existing cluster", n.config.Name)
+				return id, nil
+			}
+			log.Printf("cluster: shared node %q cannot register yet: %s; retrying", n.config.Name, err)
+		} else if n.bootstrap {
+			log.Printf("cluster: shared bootstrap node %q creating the initial cluster", n.config.Name)
+			return 0, nil
+		} else {
+			log.Printf("cluster: shared node %q waiting for an existing cluster: %s", n.config.Name, err)
+		}
+		if !clusterRetry(ctx) {
+			return 0, nil
+		}
+	}
+	return 0, nil
 }
 
 func clusterRetry(ctx context.Context) bool {

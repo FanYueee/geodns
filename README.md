@@ -170,7 +170,96 @@ serve a given set of followers in this mode.
 
 ### One-process HA with embedded etcd
 
-For the simplest HA deployment, use
+For a shared configuration on all hosts, use
+[`dns/geodns.shared.conf.sample`](dns/geodns.shared.conf.sample). This format
+requires no `members` or `join` settings:
+
+```ini
+[cluster]
+enabled = true
+token = replace-with-the-same-long-random-secret
+bootstrap = pop-1
+
+[node "pop-1"]
+address = 10.80.0.11
+listen = 23.160.172.53,2602:f37b:53::53
+weight = 300
+zone-directory = source-zones
+
+[node "pop-2"]
+address = 10.80.0.12
+listen = 192.0.2.12,2001:db8::12
+weight = 200
+
+[node "pop-3"]
+address = 10.80.0.13
+listen = 192.0.2.13,2001:db8::13
+weight = 100
+```
+
+Replace every `address` with that host's WG IP and every `listen` with its
+public DNS IPs. Configure WG first. Copy this same file to
+`/srv/geodns/node/geodns.conf` on every host, put Zone JSON files in
+`/srv/geodns/node/source-zones/` on `pop-1`, and start each host:
+
+```sh
+geodns -config /srv/geodns/node/geodns.conf
+```
+
+GeoDNS identifies itself by matching a node's WG address to a local interface.
+An optional `[cluster] id` selects one entry when several entries match local
+interfaces. `bootstrap` names the host that creates the store on first startup;
+it does **not** fix the master. Other hosts wait for the store, register
+automatically as learners, and become voters after catching up. All hosts serve
+DNS and participate in controller election according to their weights. HA is
+established after the initial voters have joined; inspect `-cluster-status` to
+confirm membership. Preserve each host's `etcd-data/` on restarts and upgrades,
+particularly the bootstrap host's: starting it with empty data while the
+existing cluster is unreachable can create a separate store.
+
+To add `pop-4`, append its section to the configuration on any **running** host:
+
+```ini
+[node "pop-4"]
+address = 10.80.0.14
+listen = 192.0.2.14,2001:db8::14
+weight = 50
+```
+
+Copy the updated file and binary to the new host, configure its IPs, and start
+with the same command. Existing processes receive the desired member list
+automatically through etcd; no restarts or separate join command are needed.
+An offline declared host does not count toward quorum until it actually joins.
+A new host can also submit a configuration that only extends the current list
+with unchanged settings for existing hosts. Add hosts one at a time.
+
+To permanently remove a node, delete its section on a running host while quorum
+is available. If removing the bootstrap host, change `bootstrap` to a retained
+node in the same edit. The elected controller removes the etcd member, then the
+removed host's process exits. It stays online until removal commits so quorum
+is preserved, including when shrinking from two voters to one. Temporary
+maintenance needs no configuration edit. Re-adding a permanently removed host
+requires the current configuration and a fresh data directory; preserve its old
+data for recovery.
+
+Node entries and weights are checked for local file changes every second and
+published to etcd; other hosts receive updates through an etcd watch. Invalid
+updates retain the last valid deployment. Priority changes renew the election
+automatically. Local configuration files are not overwritten: updates apply to
+running processes, and unchanged stale files do not roll back newer deployment
+state on restart. File edits merge only the fields changed locally, preserving
+unrelated updates from other hosts; concurrent publishes retry. A persistent
+local baseline in `etcd-data/deployment-local.json` also detects edits made while
+a host is stopped and applies them after restart without reverting unrelated
+remote updates. Keep a current configuration copy for new hosts. DNS `listen` and
+Zone source-directory changes require restarting the affected host with that
+copy. A WG address change requires replacing the member. Changes to shared
+cluster name, token, ports, or deployment mode require coordinated restarts.
+
+The earlier per-host configuration below remains supported, including external
+etcd HA, single-master, and original standalone DNS modes.
+
+For separate configurations on each host, use
 [`dns/geodns.cluster.conf.sample`](dns/geodns.cluster.conf.sample). The official
 etcd server is embedded in `geodns`: one binary, one configuration file, and one
 process per host run DNS, the shared store, controller election, WebSocket
@@ -205,7 +294,8 @@ the current controller closes its sync streams and yields automatically. Nodes
 reconnect to the new controller and keep answering DNS from their local Zones.
 Weights are nonnegative integers and default to `0`. Equal weights keep the
 existing controller, so deployments without weights retain their previous
-election behavior. Weight changes require restarting that node; Zone file edits
+election behavior. In this per-host format, weight changes require restarting
+that node; shared node entries above update weights live. Zone file edits
 remain live. This controls the **GeoDNS master**, not etcd's internal Raft leader
 or DNS record weights, and still requires etcd quorum. For external etcd HA or
 the separate controller binary, set `weight` in `[controller]` instead.

@@ -121,7 +121,11 @@ func main() {
 		log.Printf("error reading config file %s: %s", configFileName, err)
 		os.Exit(2)
 	}
-	*flaginter, *flagport = dnsListenConfig(*appconfig.Config, *flaginter, *flagport, setFlags["interface"], setFlags["port"])
+	startupConfig, err := resolveSharedConfig(*appconfig.Config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	*flaginter, *flagport = dnsListenConfig(startupConfig, *flaginter, *flagport, setFlags["interface"], setFlags["port"])
 	if *flagClusterStatus || *flagClusterRemove != "" {
 		if *flagpublish || *flagcheckconfig || (*flagClusterStatus && *flagClusterRemove != "") {
 			log.Fatal("cluster management commands cannot be combined with other actions")
