@@ -25,7 +25,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
@@ -52,17 +51,19 @@ import (
 var serverInfo *monitor.ServerInfo
 
 var (
-	flagconfig      = flag.String("config", "./dns/", "directory of zone files")
-	flagconfigfile  = flag.String("configfile", "geodns.conf", "filename of config file (in 'config' directory)")
-	flagcheckconfig = flag.Bool("checkconfig", false, "check configuration and exit")
-	flagpublish     = flag.Bool("publish", false, "publish HA zones to etcd and exit")
-	flagidentifier  = flag.String("identifier", "", "identifier (hostname, pop name or similar)")
-	flaginter       = flag.String("interface", "*", "set the listener address")
-	flagport        = flag.String("port", "53", "default port number")
-	flaghttp        = flag.String("http", ":8053", "http listen address (:8053)")
-	flaglog         = flag.Bool("log", false, "be more verbose")
-	flagcpus        = flag.Int("cpus", 0, "Set the maximum number of CPUs to use")
-	flagLogFile     = flag.String("logfile", "", "log to file")
+	flagconfig        = flag.String("config", "./dns/", "configuration directory or path to geodns.conf")
+	flagconfigfile    = flag.String("configfile", "geodns.conf", "filename of config file (in 'config' directory)")
+	flagcheckconfig   = flag.Bool("checkconfig", false, "check configuration and exit")
+	flagpublish       = flag.Bool("publish", false, "publish HA zones to etcd and exit")
+	flagClusterStatus = flag.Bool("cluster-status", false, "list embedded cluster members and exit")
+	flagClusterRemove = flag.String("cluster-remove", "", "remove an embedded cluster member by node ID or hexadecimal member ID and exit")
+	flagidentifier    = flag.String("identifier", "", "identifier (hostname, pop name or similar)")
+	flaginter         = flag.String("interface", "*", "set the listener address")
+	flagport          = flag.String("port", "53", "default port number")
+	flaghttp          = flag.String("http", ":8053", "http listen address (:8053)")
+	flaglog           = flag.Bool("log", false, "be more verbose")
+	flagcpus          = flag.Int("cpus", 0, "Set the maximum number of CPUs to use")
+	flagLogFile       = flag.String("logfile", "", "log to file")
 
 	flagShowVersion = flag.Bool("version", false, "Show GeoDNS version")
 
@@ -108,18 +109,29 @@ func main() {
 		}
 	}
 
-	var configFileName string
-
-	if filepath.IsAbs(*flagconfigfile) {
-		configFileName = *flagconfigfile
-	} else {
-		configFileName = filepath.Clean(filepath.Join(*flagconfig, *flagconfigfile))
+	setFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	configDir, configFileName, err := configLocation(*flagconfig, *flagconfigfile, setFlags["configfile"])
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	err := appconfig.ConfigReader(configFileName)
+	*flagconfig = configDir
+	err = appconfig.ConfigReader(configFileName)
 	if err != nil {
 		log.Printf("error reading config file %s: %s", configFileName, err)
 		os.Exit(2)
+	}
+	*flaginter, *flagport = dnsListenConfig(*appconfig.Config, *flaginter, *flagport, setFlags["interface"], setFlags["port"])
+	if *flagClusterStatus || *flagClusterRemove != "" {
+		if *flagpublish || *flagcheckconfig || (*flagClusterStatus && *flagClusterRemove != "") {
+			log.Fatal("cluster management commands cannot be combined with other actions")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := manageCluster(ctx, *appconfig.Config, configFileName, *flagClusterRemove, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	if *flagpublish {
@@ -139,7 +151,7 @@ func main() {
 	var syncMaster *zonesync.Master
 	var syncFollower *zonesync.Follower
 	var ha *haNode
-	if appconfig.Config.Sync.Mode == "ha" {
+	if appconfig.Config.Sync.Mode == "ha" || appconfig.Config.Cluster.Enabled {
 		httpExplicit := false
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name == "http" {
@@ -188,7 +200,11 @@ func main() {
 		<-ctx.Done()
 		log.Printf("server shutting down")
 		go func() {
-			time.Sleep(time.Second * 5)
+			grace := 5 * time.Second
+			if ha != nil && ha.embedded != nil {
+				grace = 15 * time.Second
+			}
+			time.Sleep(grace)
 			log.Fatal("shutdown appears stalled; force exit")
 			os.Exit(99)
 		}()

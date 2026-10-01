@@ -131,7 +131,7 @@ func (c *Cluster) Run(ctx context.Context) error {
 		default:
 		}
 		if !leaseLost || ctx.Err() != nil {
-			resignCtx, stopResign := context.WithTimeout(context.Background(), 2*time.Second)
+			resignCtx, stopResign := context.WithTimeout(c.store.client.Ctx(), 2*time.Second)
 			if err := election.Resign(resignCtx); err != nil && ctx.Err() == nil {
 				log.Printf("zone sync: controller %q could not resign leadership: %s", c.id, err)
 			}

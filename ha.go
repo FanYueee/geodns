@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/abh/geodns/v3/appconfig"
@@ -20,9 +21,14 @@ type haNode struct {
 	store        *zonesync.Store
 	httpAddr     string
 	bootstrapDir string
+	embedded     *embeddedNode
 }
 
 func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, httpExplicit bool) (*haNode, error) {
+	cfg, embedded, err := embeddedConfig(cfg, configFile)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.Sync.Mode != "ha" {
 		return nil, errors.New("[sync] mode = ha is required")
 	}
@@ -64,9 +70,27 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 	if httpAddr == "" {
 		return nil, errors.New("HA node requires an HTTP listener")
 	}
-	store, err := dialControllerStore(controller)
+	autoSync := time.Duration(0)
+	if embedded != nil {
+		autoSync = 30 * time.Second
+		dataDir, err := filepath.Abs(embedded.config.Dir)
+		if err != nil {
+			return nil, err
+		}
+		cache, err := filepath.Abs(zoneDir)
+		if err != nil {
+			return nil, err
+		}
+		if dataDir == cache || dataDir == controller.ZoneDirectory {
+			return nil, errors.New("embedded etcd data-directory must differ from the config and source directories")
+		}
+	}
+	store, err := dialControllerStore(controller, autoSync)
 	if err != nil {
 		return nil, err
+	}
+	if embedded != nil {
+		embedded.store = store
 	}
 	id := controller.ID
 	if id == "" {
@@ -99,12 +123,36 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		store.Close()
 		return nil, err
 	}
-	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr, bootstrapDir: controller.ZoneDirectory}, nil
+	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr, bootstrapDir: controller.ZoneDirectory, embedded: embedded}, nil
 }
 
 func (n *haNode) Run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return n.controller.Run(ctx) })
+	controllerDone := make(chan struct{})
+	stopEmbedded := func() {}
+	if n.embedded != nil {
+		var embeddedCtx context.Context
+		embeddedCtx, stopEmbedded = context.WithCancel(context.WithoutCancel(ctx))
+		defer stopEmbedded()
+		g.Go(func() error { return n.embedded.Run(embeddedCtx) })
+	}
+	// Campaign's cancellation cleanup uses the client's context. Closing our
+	// owned client prevents that cleanup from waiting on a stopped local server.
+	g.Go(func() error {
+		<-ctx.Done()
+		select {
+		case <-controllerDone:
+		case <-time.After(2 * time.Second):
+		}
+		n.store.Close()
+		<-controllerDone
+		stopEmbedded()
+		return nil
+	})
+	g.Go(func() error {
+		defer close(controllerDone)
+		return n.controller.Run(ctx)
+	})
 	if n.bootstrapDir != "" {
 		g.Go(func() error {
 			for ctx.Err() == nil {
@@ -125,7 +173,7 @@ func (n *haNode) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
-func dialControllerStore(c appconfig.ControllerConfig) (*zonesync.Store, error) {
+func dialControllerStore(c appconfig.ControllerConfig, autoSync time.Duration) (*zonesync.Store, error) {
 	prefix := c.EtcdPrefix
 	if prefix == "" {
 		prefix = "/geodns"
@@ -134,21 +182,29 @@ func dialControllerStore(c appconfig.ControllerConfig) (*zonesync.Store, error) 
 		Endpoints: c.EtcdEndpoints, Prefix: prefix, Username: c.EtcdUser,
 		PasswordFile: c.EtcdPasswordFile, CAFile: c.EtcdCA,
 		CertFile: c.EtcdCert, KeyFile: c.EtcdKey,
+		AutoSyncInterval: autoSync,
 	})
 }
 
 func publishHANode(ctx context.Context, cfg appconfig.AppConfig, configFile string) (string, error) {
+	cfg, embedded, err := embeddedConfig(cfg, configFile)
+	if err != nil {
+		return "", err
+	}
 	if cfg.Sync.Mode != "ha" {
 		return "", errors.New("-publish requires [sync] mode = ha")
 	}
 	controller := cfg.Controller.ResolvePaths(configFile)
+	if embedded != nil {
+		controller.EtcdEndpoints = strings.Join(embedded.endpoints(), ",")
+	}
 	if controller.Mode != "" && controller.Mode != "ha" {
 		return "", errors.New("-publish requires [controller] mode = ha")
 	}
 	if controller.ZoneDirectory == "" {
 		return "", errors.New("-publish requires [controller] zone-directory")
 	}
-	store, err := dialControllerStore(controller)
+	store, err := dialControllerStore(controller, 0)
 	if err != nil {
 		return "", err
 	}

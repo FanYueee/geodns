@@ -13,13 +13,14 @@ import (
 )
 
 type EtcdOptions struct {
-	Endpoints    string
-	Prefix       string
-	Username     string
-	PasswordFile string
-	CAFile       string
-	CertFile     string
-	KeyFile      string
+	Endpoints        string
+	Prefix           string
+	Username         string
+	PasswordFile     string
+	CAFile           string
+	CertFile         string
+	KeyFile          string
+	AutoSyncInterval time.Duration
 }
 
 func DialStore(o EtcdOptions) (*Store, error) {
@@ -33,7 +34,7 @@ func DialStore(o EtcdOptions) (*Store, error) {
 			return nil, errors.New("empty etcd endpoint")
 		}
 	}
-	config := clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second, Username: o.Username}
+	config := clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second, Username: o.Username, AutoSyncInterval: o.AutoSyncInterval}
 	if o.PasswordFile != "" {
 		password, err := os.ReadFile(o.PasswordFile)
 		if err != nil {
@@ -60,7 +61,13 @@ func DialStore(o EtcdOptions) (*Store, error) {
 	return store, nil
 }
 
-func (s *Store) Close() error { return s.client.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.client.Close() })
+	return s.closeErr
+}
+
+// SetEndpoints switches to the local member once embedded etcd is ready.
+func (s *Store) SetEndpoints(endpoints ...string) { s.client.SetEndpoints(endpoints...) }
 
 func etcdTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
 	config := &tls.Config{MinVersion: tls.VersionTLS12}

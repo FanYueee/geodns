@@ -76,7 +76,9 @@ Notable command line parameters (and their defaults)
 
 * -config="./dns/"
 
-Directory of zone files (and configuration named `geodns.conf`).
+Directory of zone files (and configuration named `geodns.conf`), or the path to
+the configuration file itself. With a file path, its parent directory holds the
+synced Zone JSON files. `-configfile` remains available for directory-based use.
 
 * -checkconfig=false
 
@@ -89,6 +91,11 @@ Comma separated IPs to listen on for DNS requests.
 * -port="53"
 
 Port number for DNS requests (UDP and TCP)
+
+DNS addresses and the default port can also be set as `[dns] listen` (a
+comma-separated list, including IPv6) and `port` in `geodns.conf`. Explicit
+`-interface` and `-port` flags override them. Listener and cluster settings take
+effect at startup; Zone file updates reload while running.
 
 * -http=":8053"
 
@@ -161,7 +168,111 @@ single-master behavior without a DNS listener, build the controller with
 Its `-logfile` and `-checkconfig` flags work like GeoDNS's. Only one master should
 serve a given set of followers in this mode.
 
-For automatic controller failover, deploy three etcd members on separate hosts
+### One-process HA with embedded etcd
+
+For the simplest HA deployment, use
+[`dns/geodns.cluster.conf.sample`](dns/geodns.cluster.conf.sample). The official
+etcd server is embedded in `geodns`: one binary, one configuration file, and one
+process per host run DNS, the shared store, controller election, WebSocket
+updates, and node heartbeats. No separate etcd installation or `etcd.yml` is
+needed. Every node serves DNS and is eligible to become the GeoDNS controller.
+The original standalone mode remains the default when `[cluster]` is absent or
+`enabled = false`; disabled cluster fields are ignored.
+
+On three hosts with reachable private/WireGuard IPs, create a dedicated
+directory such as `/srv/geodns/node` containing `geodns.conf`. For the first host:
+
+```ini
+[dns]
+listen = 10.80.0.11
+
+[cluster]
+enabled = true
+id = pop-1
+address = 10.80.0.11
+token = replace-with-the-same-long-random-secret
+members = pop-1=10.80.0.11,pop-2=10.80.0.12,pop-3=10.80.0.13
+zone-directory = source-zones
+```
+
+On the second and third hosts, change `id`, `address`, and `[dns] listen` to that
+host's values; keep `members` and `token` identical and omit `zone-directory`.
+`address` binds embedded etcd and the sync API to this node's private IP. DNS
+`listen` may instead list public addresses, e.g.
+`23.160.172.53,2602:f37b:53::53`. Put initial Zone JSON files in the first host's
+`source-zones/` directory beside `geodns.conf`, then start each host:
+
+```sh
+geodns -config /srv/geodns/node/geodns.conf
+```
+
+Initial Zones are imported automatically and later source file edits are
+validated and pushed live. Do not manually edit the received JSON files beside
+`geodns.conf`. The default local etcd data directory is `etcd-data/` beside the
+configuration file; preserve it across upgrades and restarts. Override it with
+`[cluster] data-directory` to use another persistent volume. Cluster `name`
+defaults to `geodns` and must match on every host. Optional `client-port`,
+`peer-port`, and `sync-port` default to 2379, 2380, and 8053; all members must
+share these port settings. Do not combine `[cluster]` with `[sync]` or
+`[controller]`; use the external mode below when you already run etcd.
+Embedded mode creates a new store and does not migrate external etcd data.
+Keep an existing deployment on external mode until its latest Zone files and
+backups are prepared for migration; an external server cannot listen on the
+same addresses and ports as the embedded server.
+
+To add another host, use the same config with a new `id`, `address`, and DNS
+`listen`, omit both `members` and `zone-directory`, and set:
+
+```ini
+join = 10.80.0.11,10.80.0.12,10.80.0.13
+```
+
+Start it with the same command. GeoDNS registers its embedded etcd as a learner,
+starts replication, and promotes it to a voting member once caught up; existing
+configs do not change. Pending joins and promotion retry automatically. Keep
+the join config and persistent data on restarts. Add members one at a time;
+three or five voters are the usual HA layouts. A four-voter cluster requires
+three online members and tolerates one failure, just like a three-voter cluster.
+
+To inspect registered members and the elected GeoDNS controller, run on a live
+host (this command does not start a second embedded server):
+
+```sh
+geodns -config /srv/geodns/node/geodns.conf -cluster-status
+```
+
+To remove a host permanently, stop its GeoDNS process, then run on another live
+host while the cluster still has quorum:
+
+```sh
+geodns -config /srv/geodns/node/geodns.conf -cluster-remove pop-4
+```
+
+The remove flag also accepts the hexadecimal `MEMBER-ID` shown by
+`-cluster-status`, including learners whose startup failed before they acquired
+a name. Stop any joining process before removing its pending member.
+
+Stopping a process only stops its election candidacy; permanently removing its
+etcd voter requires this command so the quorum size is updated. Preserve the
+removed member's old data for recovery and do not restart it with an empty data
+directory and its old `members` list. Joining again is a fresh member operation
+with a new data directory and `join` configuration.
+
+Embedded etcd clients discover current voting members automatically. Startup and
+membership events, promotion failures, and disconnects are logged by GeoDNS.
+TCP 2379, 2380, and 8053 must be reachable between the nodes, while DNS uses
+TCP/UDP 53 by default. Restrict the embedded etcd and sync ports to the private
+network: the shared token authenticates GeoDNS sync, **not** etcd client or peer
+requests. Embedded mode uses HTTP over the private tunnel; use the external etcd
+mode for authenticated TLS configurations. A majority of etcd voters must be
+online for election and publication; nodes with cached Zones can continue
+answering DNS during loss of quorum. Back up persistent etcd data using etcd's
+snapshot tools before maintenance. Automatic compaction retains one hour of
+store history.
+
+### HA with external etcd
+
+For automatic controller failover with a separately managed store, deploy three etcd members on separate hosts
 reachable over a private network. On each host, copy
 [`dns/etcd.ha.yml.sample`](dns/etcd.ha.yml.sample) to `/etc/geodns/etcd.yml`.
 Change the member name and its local IPs on each host, but keep the complete

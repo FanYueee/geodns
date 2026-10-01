@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,14 @@ func TestHANodeDiscoveryAndLegacyConfiguration(t *testing.T) {
 }
 
 func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
+	for _, embedded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("embedded=%t", embedded), func(t *testing.T) {
+			testHANodeServesAndReceivesZones(t, embedded)
+		})
+	}
+}
+
+func testHANodeServesAndReceivesZones(t *testing.T, embedded bool) {
 	reserveURL := func() url.URL {
 		t.Helper()
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -108,15 +117,17 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	etcdConfig.ListenClientUrls = []url.URL{clientURL}
 	etcdConfig.AdvertiseClientUrls = []url.URL{clientURL}
 	etcdConfig.InitialCluster = etcdConfig.InitialClusterFromName(etcdConfig.Name)
-	etcd, err := embed.StartEtcd(etcdConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer etcd.Close()
-	select {
-	case <-etcd.Server.ReadyNotify():
-	case <-time.After(15 * time.Second):
-		t.Fatal("embedded etcd did not start")
+	if !embedded {
+		etcd, err := embed.StartEtcd(etcdConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer etcd.Close()
+		select {
+		case <-etcd.Server.ReadyNotify():
+		case <-time.After(15 * time.Second):
+			t.Fatal("external etcd did not start")
+		}
 	}
 
 	sourceDir, nodeDir := t.TempDir(), t.TempDir()
@@ -135,12 +146,24 @@ func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	cfg.Controller.EtcdEndpoints = clientURL.String()
 	cfg.Controller.EtcdPrefix = "/test/ha-node"
 	cfg.Controller.ZoneDirectory = sourceDir
+	if embedded {
+		cfg.Sync, cfg.Controller = appconfig.SyncConfig{}, appconfig.ControllerConfig{}
+		clientPort, _ := strconv.Atoi(clientURL.Port())
+		peerPort, _ := strconv.Atoi(peerURL.Port())
+		_, syncPortText, _ := net.SplitHostPort(httpServer.Listener.Addr().String())
+		syncPort, _ := strconv.Atoi(syncPortText)
+		cfg.Cluster = appconfig.ClusterConfig{
+			Enabled: true, ID: "node-1", Address: "127.0.0.1", Token: "secret",
+			Members: "node-1=127.0.0.1", ZoneDirectory: sourceDir,
+			ClientPort: clientPort, PeerPort: peerPort, SyncPort: syncPort,
+		}
+	}
 	node, err := newHANode(cfg, nodeDir, filepath.Join(nodeDir, "geodns.conf"), ":8053", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer node.store.Close()
-	if node.httpAddr != cfg.Controller.Listen {
+	if node.httpAddr != httpServer.Listener.Addr().String() {
 		t.Fatalf("HTTP listen address = %q, want %q", node.httpAddr, cfg.Controller.Listen)
 	}
 	previousRegisterer, previousGatherer := prometheus.DefaultRegisterer, prometheus.DefaultGatherer

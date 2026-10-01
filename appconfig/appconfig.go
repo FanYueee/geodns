@@ -18,6 +18,8 @@ type AppConfig struct {
 	DNS struct {
 		PublicDebugQueries bool
 		DetailedMetrics    bool
+		Listen             string
+		Port               string
 	}
 	GeoIP struct {
 		Directory string
@@ -41,6 +43,7 @@ type AppConfig struct {
 	}
 	Sync       SyncConfig
 	Controller ControllerConfig
+	Cluster    ClusterConfig
 	Nodeping   struct {
 		Token string
 	}
@@ -52,6 +55,22 @@ type AppConfig struct {
 		AppKey       string
 		StateMap     string
 	}
+}
+
+// ClusterConfig provides one-process DNS and embedded etcd deployment.
+type ClusterConfig struct {
+	Enabled       bool
+	ID            string
+	Address       string
+	Members       string
+	Join          string
+	Token         string
+	Name          string
+	DataDirectory string `gcfg:"data-directory"`
+	ZoneDirectory string `gcfg:"zone-directory"`
+	ClientPort    int    `gcfg:"client-port"`
+	PeerPort      int    `gcfg:"peer-port"`
+	SyncPort      int    `gcfg:"sync-port"`
 }
 
 type SyncConfig struct {

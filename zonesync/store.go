@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/abh/geodns/v3/zones"
@@ -29,8 +30,10 @@ type storedSnapshot struct {
 }
 
 type Store struct {
-	client *clientv3.Client
-	prefix string
+	client    *clientv3.Client
+	prefix    string
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewStore(client *clientv3.Client, prefix string) (*Store, error) {

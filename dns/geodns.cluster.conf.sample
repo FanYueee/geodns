@@ -1,0 +1,30 @@
+; One geodns process runs DNS, embedded etcd, election, sync, and heartbeats.
+; Start: geodns -config /srv/geodns/node/geodns.conf
+; Do not add [sync] or [controller] when using [cluster].
+
+[dns]
+; Comma-separated IPs; change to this host's DNS addresses. IPv6 needs no brackets.
+listen = 10.80.0.11
+
+[cluster]
+enabled = true
+id = pop-1
+address = 10.80.0.11
+token = replace-with-the-same-long-random-secret
+members = pop-1=10.80.0.11,pop-2=10.80.0.12,pop-3=10.80.0.13
+; Only the editing node sets this. Initial import and later edits are automatic.
+; zone-directory = source-zones
+; Defaults: name = geodns, data-directory = etcd-data (beside geodns.conf).
+; Keep data-directory on persistent storage; never share it between nodes.
+; name = production
+; data-directory = /var/lib/geodns/etcd
+; client-port = 2379
+; peer-port = 2380
+; sync-port = 8053
+
+; To add a new node, change id/address/listen, REMOVE members, and set:
+; join = 10.80.0.11,10.80.0.12,10.80.0.13
+; It registers as a learner and promotes automatically when caught up.
+; Restart with the same config and data directory; do not change join to members.
+; All nodes use the same name/token and ports. Use a private network/firewall:
+; token authenticates GeoDNS sync, not the embedded etcd client/peer APIs.
