@@ -131,10 +131,14 @@ func (s *Store) loadCurrent(ctx context.Context) (snapshot, int64, error) {
 	if err != nil {
 		return snapshot{}, etcdRevision, err
 	}
+	return s.loadSnapshot(ctx, meta, etcdRevision)
+}
+
+func (s *Store) loadSnapshot(ctx context.Context, meta storedSnapshot, etcdRevision int64) (snapshot, int64, error) {
 	data := make([]byte, 0, meta.Chunks*snapshotChunkSize)
 	for i := 0; i < meta.Chunks; i++ {
 		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		resp, err := s.client.Get(requestCtx, s.chunkKey(meta.Revision, i))
+		resp, err := s.client.Get(requestCtx, s.chunkKey(meta.Revision, i), clientv3.WithRev(etcdRevision))
 		cancel()
 		if err != nil {
 			return snapshot{}, 0, err
@@ -181,22 +185,16 @@ func (s *Store) Bootstrap(ctx context.Context, dir string) (string, error) {
 }
 
 func (s *Store) publish(ctx context.Context, dir string, bootstrap, requireZones bool) (string, error) {
-	session, err := concurrency.NewSession(s.client, concurrency.WithTTL(30), concurrency.WithContext(ctx))
+	mutex, release, err := s.lockPublication(ctx)
 	if err != nil {
 		return "", err
 	}
-	defer session.Close()
-	mutex := concurrency.NewMutex(session, s.prefix+"/publish-lock")
-	if err := mutex.Lock(ctx); err != nil {
-		return "", err
-	}
-	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := mutex.Unlock(unlockCtx); err != nil {
-			log.Printf("zone sync: release publish lock: %s", err)
+	defer release()
+	if !bootstrap {
+		if err := s.checkZoneMode(ctx, "files"); err != nil {
+			return "", err
 		}
-	}()
+	}
 	previous, _, err := s.currentMetadata(ctx)
 	if err != nil && !errors.Is(err, ErrNoSnapshot) {
 		return "", err
@@ -221,12 +219,43 @@ func (s *Store) publish(ctx context.Context, dir string, bootstrap, requireZones
 	if err != nil || verified.Revision != snapshot.Revision {
 		return "", errors.New("zone files changed while publishing; retry")
 	}
-	data, err := json.Marshal(snapshot)
-	if err != nil || len(data) > maxStoredSnapshot {
-		return "", errors.New("zone snapshot exceeds etcd storage limit")
-	}
 	if previous.Revision == snapshot.Revision {
 		return snapshot.Revision, nil
+	}
+	guards := []clientv3.Cmp{}
+	if bootstrap {
+		guards = append(guards, clientv3.Compare(clientv3.Version(s.currentKey()), "=", 0))
+	}
+	_, err = s.commitSnapshot(ctx, mutex, snapshot, previous.Revision, guards)
+	return snapshot.Revision, err
+}
+
+func (s *Store) lockPublication(ctx context.Context) (*concurrency.Mutex, func(), error) {
+	session, err := concurrency.NewSession(s.client, concurrency.WithTTL(30), concurrency.WithContext(ctx))
+	if err != nil {
+		return nil, nil, err
+	}
+	mutex := concurrency.NewMutex(session, s.prefix+"/publish-lock")
+	if err := mutex.Lock(ctx); err != nil {
+		session.Close()
+		return nil, nil, err
+	}
+	return mutex, func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := mutex.Unlock(unlockCtx); err != nil {
+			log.Printf("zone sync: release publish lock: %s", err)
+		}
+		session.Close()
+	}, nil
+}
+
+// All publishers serialize chunk creation and pruning with the same leased lock.
+// Management writes additionally fence the election term and current version.
+func (s *Store) commitSnapshot(ctx context.Context, mutex *concurrency.Mutex, snapshot snapshot, previous string, guards []clientv3.Cmp) (int64, error) {
+	data, err := json.Marshal(snapshot)
+	if err != nil || len(data) > maxSnapshotSize {
+		return 0, errSnapshotTooLarge
 	}
 	chunks := (len(data) + snapshotChunkSize - 1) / snapshotChunkSize
 	for i := 0; i < chunks; i++ {
@@ -235,30 +264,27 @@ func (s *Store) publish(ctx context.Context, dir string, bootstrap, requireZones
 		_, err := s.client.Put(requestCtx, s.chunkKey(snapshot.Revision, i), string(data[i*snapshotChunkSize:end]))
 		cancel()
 		if err != nil {
-			return "", err
+			return 0, err
 		}
 	}
 	meta, err := json.Marshal(storedSnapshot{Revision: snapshot.Revision, Chunks: chunks})
 	if err != nil {
-		return "", err
+		return 0, err
 	}
+	guards = append(guards, mutex.IsOwner())
 	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	guards := []clientv3.Cmp{mutex.IsOwner()}
-	if bootstrap {
-		guards = append(guards, clientv3.Compare(clientv3.Version(s.currentKey()), "=", 0))
-	}
 	commit, err := s.client.Txn(requestCtx).If(guards...).Then(clientv3.OpPut(s.currentKey(), string(meta))).Commit()
 	cancel()
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	if !commit.Succeeded {
-		return "", errors.New("publish lease expired before commit")
+		return 0, errLeadershipChanged
 	}
-	if err := s.prune(ctx, mutex, snapshot.Revision, previous.Revision); err != nil {
+	if err := s.prune(ctx, mutex, snapshot.Revision, previous); err != nil {
 		log.Printf("zone sync: prune old snapshots: %s", err)
 	}
-	return snapshot.Revision, nil
+	return commit.Header.Revision, nil
 }
 
 func (s *Store) prune(ctx context.Context, mutex *concurrency.Mutex, current, previous string) error {

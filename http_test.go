@@ -73,6 +73,25 @@ func TestSyncAPIUsesTokenWithHTTPBasicAuth(t *testing.T) {
 		t.Fatalf("sync API with token: HTTP %d", w.Code)
 	}
 
+	cluster, err := zonesync.NewCluster(&zonesync.Store{}, "pop-1", "sync-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiHandler := &basicauth{h: NewHTTPServer(nil, serverInfo, cluster).Mux(), syncAPI: true}
+	for _, path := range []string{zonesync.MasterPath, zonesync.Path + "/example.com"} {
+		w = httptest.NewRecorder()
+		apiHandler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusUnauthorized || !bytes.Contains(w.Body.Bytes(), []byte("unauthorized")) {
+			t.Fatalf("management API bypassed token auth: %d %s", w.Code, w.Body)
+		}
+	}
+	req = httptest.NewRequest(http.MethodGet, zonesync.Path+"/bad/name", nil)
+	req.Header.Set("Authorization", "Bearer sync-secret")
+	w = httptest.NewRecorder()
+	apiHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("management bearer auth with HTTP basic configured: HTTP %d", w.Code)
+	}
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if w.Code != http.StatusUnauthorized {

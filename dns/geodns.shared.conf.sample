@@ -7,12 +7,15 @@ enabled = true
 token = replace-with-the-same-long-random-secret
 ; This host creates the cluster on FIRST startup; keep its existing data afterward.
 bootstrap = pop-1
+; Zone changes go through the elected master API. Legacy file watching: files.
+zone-mode = api
 
 [node "pop-1"]
 address = 10.80.0.11
 listen = 23.160.172.53,2602:f37b:53::53
 weight = 300
-zone-directory = source-zones
+; Optional one-time import for an empty cluster; later edits are ignored.
+; zone-directory = source-zones
 
 [node "pop-2"]
 address = 10.80.0.12

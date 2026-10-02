@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/abh/geodns/v3/appconfig"
@@ -80,6 +81,7 @@ func NewHTTPServer(mm *zones.MuxManager, serverInfo *monitor.ServerInfo, syncHan
 	hs.mux.HandleFunc("/", hs.mainServer)
 	hs.mux.Handle("/metrics", promhttp.Handler())
 	if syncHandler != nil {
+		zonesync.RegisterManagementRoutes(hs.mux, syncHandler)
 		hs.mux.Handle(zonesync.Path, syncHandler)
 		hs.mux.HandleFunc(zonesync.StreamPath, syncHandler.ServeStream)
 		hs.mux.HandleFunc(zonesync.NodesPath, syncHandler.ServeNodes)
@@ -100,7 +102,7 @@ func (hs *httpServer) Run(ctx context.Context, listen string) error {
 		Handler:      &basicauth{h: hs.mux, syncAPI: hs.syncHandler != nil},
 		ReadTimeout:  5 * time.Second,
 		IdleTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -140,7 +142,7 @@ type basicauth struct {
 }
 
 func (b *basicauth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if b.syncAPI && (r.URL.Path == zonesync.Path || r.URL.Path == zonesync.StreamPath || r.URL.Path == zonesync.NodesPath) {
+	if b.syncAPI && (r.URL.Path == zonesync.Path || r.URL.Path == zonesync.StreamPath || r.URL.Path == zonesync.NodesPath || r.URL.Path == zonesync.MasterPath || strings.HasPrefix(r.URL.Path, zonesync.Path+"/")) {
 		b.h.ServeHTTP(w, r)
 		return
 	}

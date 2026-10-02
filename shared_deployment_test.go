@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -12,10 +13,19 @@ import (
 	"time"
 
 	"github.com/abh/geodns/v3/appconfig"
+	"github.com/abh/geodns/v3/zonesync"
 	"gopkg.in/gcfg.v1"
 )
 
 func TestSharedDeploymentBootstrapAddHotWeightRemoveAndRestart(t *testing.T) {
+	testSharedDeployment(t, false)
+}
+
+func TestSharedManagementDeployment(t *testing.T) {
+	testSharedDeployment(t, true)
+}
+
+func testSharedDeployment(t *testing.T, api bool) {
 	clientPort, peerPort := reserveClusterPort(t), reserveClusterPort(t)
 	for peerPort == clientPort {
 		peerPort = reserveClusterPort(t)
@@ -32,6 +42,9 @@ func TestSharedDeploymentBootstrapAddHotWeightRemoveAndRestart(t *testing.T) {
 			bootstrap = 2
 		}
 		fmt.Fprintf(&b, "[cluster]\nenabled = true\ntoken = secret\nbootstrap = node-%d\nclient-port = %d\npeer-port = %d\n", bootstrap, clientPort, peerPort)
+		if api {
+			b.WriteString("zone-mode = api\n")
+		}
 		for i := 1; i <= count; i++ {
 			if i == remove {
 				continue
@@ -219,7 +232,45 @@ func TestSharedDeploymentBootstrapAddHotWeightRemoveAndRestart(t *testing.T) {
 	})
 	waitLeader(third)
 	newZone := []byte(strings.ReplaceAll(string(zone), "192.0.2.1", "192.0.2.2"))
-	if err := os.WriteFile(filepath.Join(source, "example.com.json"), newZone, 0644); err != nil {
+	if api {
+		// The source/bootstrap host is offline; update the elected master directly.
+		restartConfig, err := os.ReadFile(filepath.Join(first.dir, "geodns.conf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		first.stop()
+		waitLeader(third)
+		get, err := http.NewRequest(http.MethodGet, third.url+zonesync.Path+"/example.com", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		get.Header.Set("Authorization", "Bearer secret")
+		response, err := http.DefaultClient.Do(get)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != 200 {
+			t.Fatalf("master API read: HTTP %d", response.StatusCode)
+		}
+		put, err := http.NewRequest(http.MethodPut, third.url+zonesync.Path+"/example.com", strings.NewReader(string(newZone)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		put.Header.Set("Authorization", "Bearer secret")
+		put.Header.Set("If-Match", response.Header.Get("ETag"))
+		result, err := http.DefaultClient.Do(put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.Body.Close()
+		if result.StatusCode != 200 {
+			t.Fatalf("master API update: HTTP %d", result.StatusCode)
+		}
+		// Restart with stale JSON and stale node config; committed API data wins.
+		first = start(1, string(restartConfig), first.dir)
+		waitCount(4)
+	} else if err := os.WriteFile(filepath.Join(source, "example.com.json"), newZone, 0644); err != nil {
 		t.Fatal(err)
 	}
 	for _, node := range []*running{first, second, third, fourth} {

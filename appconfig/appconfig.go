@@ -60,6 +60,7 @@ type AppConfig struct {
 
 // ClusterConfig provides one-process DNS and embedded etcd deployment.
 type ClusterConfig struct {
+	ZoneMode      string `gcfg:"zone-mode"`
 	Enabled       bool
 	ID            string
 	Weight        int
@@ -94,6 +95,7 @@ type SyncConfig struct {
 }
 
 type ControllerConfig struct {
+	ZoneMode         string `gcfg:"zone-mode"`
 	Mode             string
 	ID               string
 	Weight           int

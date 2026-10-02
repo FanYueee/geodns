@@ -11,6 +11,9 @@ id = pop-1
 token = replace-with-the-same-long-random-secret
 
 [controller]
+; Optional master-only management API; set identically on every controller.
+; zone-mode = api
+; In API mode zone-directory imports only once; later updates use HTTP.
 ; Optional master priority. Higher wins and reclaims leadership on recovery.
 ; Equal weights (default 0) keep the current master. Changes require restart.
 ; weight = 300

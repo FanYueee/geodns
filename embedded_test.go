@@ -28,6 +28,7 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 	}
 	cfg.Cluster.ZoneDirectory = "source-zones"
 	cfg.Cluster.Weight = 300
+	cfg.Cluster.ZoneMode = "api"
 	resolved, node, err := embeddedConfig(cfg, "dns/geodns.conf")
 	if err != nil {
 		t.Fatal(err)
@@ -35,6 +36,9 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 	wantSource, _ := filepath.Abs("dns/source-zones")
 	if resolved.Controller.ResolvePaths("dns/geodns.conf").ZoneDirectory != wantSource || !filepath.IsAbs(node.config.Dir) {
 		t.Fatalf("relative paths resolved incorrectly: %+v %s", resolved.Controller, node.config.Dir)
+	}
+	if resolved.Controller.ZoneMode != "api" {
+		t.Fatal("cluster zone mode was not passed to controller")
 	}
 	if resolved.Controller.Weight != 300 {
 		t.Fatalf("cluster weight was not passed to controller: %d", resolved.Controller.Weight)
@@ -52,6 +56,7 @@ func TestEmbeddedConfigSampleAndValidation(t *testing.T) {
 		{"mixed legacy config", func(c *appconfig.AppConfig) { c.Sync.Mode = "ha" }},
 		{"port conflict", func(c *appconfig.AppConfig) { c.Cluster.ClientPort = 2380 }},
 		{"invalid name", func(c *appconfig.AppConfig) { c.Cluster.Name = "../other" }},
+		{"invalid zone mode", func(c *appconfig.AppConfig) { c.Cluster.ZoneMode = "typo" }},
 		{"negative weight", func(c *appconfig.AppConfig) { c.Cluster.Weight = -1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

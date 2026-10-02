@@ -90,13 +90,15 @@ func TestHANodeDiscoveryAndLegacyConfiguration(t *testing.T) {
 
 func TestHANodeServesAndReceivesPublishedZones(t *testing.T) {
 	for _, embedded := range []bool{false, true} {
-		t.Run(fmt.Sprintf("embedded=%t", embedded), func(t *testing.T) {
-			testHANodeServesAndReceivesZones(t, embedded)
-		})
+		for _, api := range []bool{false, true} {
+			t.Run(fmt.Sprintf("embedded=%t/api=%t", embedded, api), func(t *testing.T) {
+				testHANodeServesAndReceivesZones(t, embedded, api)
+			})
+		}
 	}
 }
 
-func testHANodeServesAndReceivesZones(t *testing.T, embedded bool) {
+func testHANodeServesAndReceivesZones(t *testing.T, embedded, api bool) {
 	reserveURL := func() url.URL {
 		t.Helper()
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -156,6 +158,13 @@ func testHANodeServesAndReceivesZones(t *testing.T, embedded bool) {
 			Enabled: true, ID: "node-1", Address: "127.0.0.1", Token: "secret",
 			Members: "node-1=127.0.0.1", ZoneDirectory: sourceDir,
 			ClientPort: clientPort, PeerPort: peerPort, SyncPort: syncPort,
+		}
+	}
+	if api {
+		if embedded {
+			cfg.Cluster.ZoneMode = "api"
+		} else {
+			cfg.Controller.ZoneMode = "api"
 		}
 	}
 	node, err := newHANode(cfg, nodeDir, filepath.Join(nodeDir, "geodns.conf"), ":8053", false)
@@ -263,7 +272,35 @@ func testHANodeServesAndReceivesZones(t *testing.T, embedded bool) {
 	}
 	waitAnswer("192.0.2.1")
 	updated := []byte(`{"data":{"www":{"a":[["192.0.2.2",1]]}}}`)
-	if err := os.WriteFile(filepath.Join(sourceDir, "example.com.json"), updated, 0644); err != nil {
+	if api {
+		get, err := http.NewRequest(http.MethodGet, httpServer.URL+zonesync.Path+"/example.com", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		get.Header.Set("Authorization", "Bearer secret")
+		version, err := http.DefaultClient.Do(get)
+		if err != nil {
+			t.Fatal(err)
+		}
+		version.Body.Close()
+		if version.StatusCode != 200 {
+			t.Fatalf("API read: HTTP %d", version.StatusCode)
+		}
+		put, err := http.NewRequest(http.MethodPut, httpServer.URL+zonesync.Path+"/example.com", strings.NewReader(string(updated)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		put.Header.Set("Authorization", "Bearer secret")
+		put.Header.Set("If-Match", version.Header.Get("ETag"))
+		result, err := http.DefaultClient.Do(put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.Body.Close()
+		if result.StatusCode != 200 {
+			t.Fatalf("API update: HTTP %d", result.StatusCode)
+		}
+	} else if err := os.WriteFile(filepath.Join(sourceDir, "example.com.json"), updated, 0644); err != nil {
 		t.Fatal(err)
 	}
 	waitAnswer("192.0.2.2")

@@ -29,6 +29,8 @@ type Cluster struct {
 	mu            sync.RWMutex
 	master        *Master
 	advertise     string
+	zoneMode      string
+	leadership    *leadership
 }
 
 type controllerAddress struct {
@@ -70,23 +72,8 @@ func (c *Cluster) SetAdvertiseURL(origin string) error {
 
 // LeaderURL reads the first election candidate, whose key shares its session lease.
 func (s *Store) LeaderURL(ctx context.Context) (string, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	resp, err := s.client.Get(requestCtx, s.prefix+"/election/", clientv3.WithFirstCreate()...)
-	if err != nil {
-		return "", err
-	}
-	if len(resp.Kvs) == 0 {
-		return "", errors.New("no controller has joined the election")
-	}
-	var address controllerAddress
-	if err := json.Unmarshal(resp.Kvs[0].Value, &address); err != nil || !validNodeID(address.ID) {
-		return "", errors.New("elected controller does not advertise a discovery address; use explicit sync urls for legacy controllers")
-	}
-	if err := validateOrigin(address.URL); err != nil {
-		return "", err
-	}
-	return address.URL, nil
+	master, err := s.Leader(ctx)
+	return master.URL, err
 }
 
 func NewCluster(store *Store, id, token string) (*Cluster, error) {
@@ -108,8 +95,22 @@ func (c *Cluster) Run(ctx context.Context) error {
 	default:
 	}
 	defer c.demote()
+	defer c.clearLeadership()
 	defer c.elected.Store(false)
 	for ctx.Err() == nil {
+		err := c.store.configureZoneMode(ctx, c.zoneMode)
+		if err != nil {
+			if errors.Is(err, errAPIMode) {
+				return err
+			}
+			if ctx.Err() == nil {
+				log.Printf("zone sync: controller %q cannot initialize zone publication mode: %s", c.id, err)
+			}
+			if !retryCluster(ctx) {
+				break
+			}
+			continue
+		}
 		weight := int(c.weight.Load())
 		value := c.id
 		if c.advertise != "" {
@@ -196,11 +197,15 @@ func (c *Cluster) runCandidate(ctx context.Context, session *concurrency.Session
 		election := concurrency.NewElection(session, c.store.prefix+"/election")
 		err := election.Campaign(termCtx, value)
 		if err == nil && termCtx.Err() == nil {
+			c.mu.Lock()
+			c.leadership = &leadership{ctx: termCtx, key: election.Key(), lease: session.Lease(), term: election.Rev()}
+			c.mu.Unlock()
 			c.elected.Store(true)
 			log.Printf("zone sync: controller %q elected leader (weight %d, term %d)", c.id, weight, election.Rev())
 			c.runLeader(termCtx, election.Key(), session.Lease())
 		}
 		stopTerm()
+		c.clearLeadership()
 		watchErr := <-preferenceDone
 		c.elected.Store(false)
 		// Stop serving and close streams BEFORE releasing the election key.
@@ -418,6 +423,10 @@ func (c *Cluster) activeMaster(w http.ResponseWriter) *Master {
 }
 
 func (c *Cluster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if c.zoneMode == "api" {
+		c.ServeZoneSet(w, r)
+		return
+	}
 	if master := c.activeMaster(w); master != nil {
 		master.ServeHTTP(w, r)
 	}

@@ -6,6 +6,9 @@ mode = controller
 token = replace-with-the-same-long-random-secret
 
 [controller]
+; Optional master-only Zone API. Set identically on every HA controller.
+; zone-mode = api
+; API mode imports zone-directory only initially and disables -publish.
 mode = ha
 id = controller-1
 ; Optional master priority; higher wins and reclaims leadership on recovery.

@@ -350,6 +350,11 @@ func (d *sharedDeployment) readFile(data, previous []byte, active deploymentSpec
 	if name == "" {
 		name = "geodns"
 	}
+	mode, err := zonesync.ZoneMode(c.ZoneMode)
+	originalMode, _ := zonesync.ZoneMode(original.ZoneMode)
+	if err != nil || mode != originalMode {
+		return nil, nil, errors.New("changing zone-mode requires restarting every controller")
+	}
 	if !c.Enabled || c.Token != original.Token || name != original.Name || defaults(c.ClientPort, 2379) != original.ClientPort || defaults(c.PeerPort, 2380) != original.PeerPort || defaults(c.SyncPort, 8053) != original.SyncPort || cfg.Sync != (appconfig.SyncConfig{}) || cfg.Controller != (appconfig.ControllerConfig{}) {
 		return nil, nil, errors.New("shared edits may change node entries and bootstrap; cluster name, token, ports and mode require restart")
 	}

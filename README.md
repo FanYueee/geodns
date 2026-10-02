@@ -179,12 +179,14 @@ requires no `members` or `join` settings:
 enabled = true
 token = replace-with-the-same-long-random-secret
 bootstrap = pop-1
+zone-mode = api
 
 [node "pop-1"]
 address = 10.80.0.11
 listen = 23.160.172.53,2602:f37b:53::53
 weight = 300
-zone-directory = source-zones
+; Optional initial import only:
+; zone-directory = source-zones
 
 [node "pop-2"]
 address = 10.80.0.12
@@ -199,8 +201,7 @@ weight = 100
 
 Replace every `address` with that host's WG IP and every `listen` with its
 public DNS IPs. Configure WG first. Copy this same file to
-`/srv/geodns/node/geodns.conf` on every host, put Zone JSON files in
-`/srv/geodns/node/source-zones/` on `pop-1`, and start each host:
+`/srv/geodns/node/geodns.conf` on every host and start each host:
 
 ```sh
 geodns -config /srv/geodns/node/geodns.conf
@@ -255,6 +256,110 @@ remote updates. Keep a current configuration copy for new hosts. DNS `listen` an
 Zone source-directory changes require restarting the affected host with that
 copy. A WG address change requires replacing the member. Changes to shared
 cluster name, token, ports, or deployment mode require coordinated restarts.
+
+### Manage Zones through the current master
+
+The shared sample selects `zone-mode = api` in `[cluster]`. Set this identically
+on every host. For external-etcd HA or separate HA controllers, set the same
+option in `[controller]`. Original standalone DNS and single-master sync remain
+unchanged. Existing HA configurations without this option retain `files` mode.
+When migrating an existing HA cluster to API management, upgrade every controller
+to this version, update their configurations and restart them together; the
+published Zones are preserved.
+
+No source directory is required: create Zones through the API after startup.
+Optionally uncomment `zone-directory` on one node and put initial JSON there
+before startup. It imports only if the cluster has never published a snapshot,
+then stops watching. Subsequent local file edits and `-publish` cannot overwrite
+API-managed data. If that host goes offline, manage Zones through the new master;
+no source directory needs to move. Removing every Zone through the API also
+keeps the empty set authoritative, so restart never reimports deleted Zones.
+
+All management requests use the existing shared Bearer token. Query **any live
+node** to discover the elected master:
+
+```sh
+curl -H 'Authorization: Bearer YOUR_TOKEN' http://10.80.0.11:8053/api/v1/master
+```
+
+Example response:
+
+```json
+{"id":"pop-2","url":"http://10.80.0.12:8053","term":12345,"weight":200}
+```
+
+Use the returned `url` for Zone requests. The endpoint uses the domain name,
+without the JSON filename suffix:
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/v1/master` | Discover master ID, URL, election term and weight from any live node |
+| `GET /api/v1/zones` | List/export the committed Zone set, with revision and ETag |
+| `GET /api/v1/zones/example.com` | Read one Zone as JSON, with ETag |
+| `PUT /api/v1/zones/example.com` | Validate and create or replace one Zone |
+| `DELETE /api/v1/zones/example.com` | Delete one Zone |
+| `GET /api/v1/nodes` | Check connected DNS nodes and their applied revisions on the master |
+
+Create a new Zone from a local JSON file:
+
+```sh
+curl -i -X PUT -H 'Authorization: Bearer YOUR_TOKEN' -H 'If-None-Match: *' --data-binary @example.com.json http://10.80.0.12:8053/api/v1/zones/example.com
+```
+
+Before changing an existing Zone, read it and its version:
+
+```sh
+curl -i -H 'Authorization: Bearer YOUR_TOKEN' http://10.80.0.12:8053/api/v1/zones/example.com
+```
+
+If the response contains `ETag: "123"`, submit the replacement with that exact
+ETag, including quotes:
+
+```sh
+curl -i -X PUT -H 'Authorization: Bearer YOUR_TOKEN' -H 'If-Match: "123"' --data-binary @example.com.json http://10.80.0.12:8053/api/v1/zones/example.com
+```
+
+Delete using the latest ETag:
+
+```sh
+curl -i -X DELETE -H 'Authorization: Bearer YOUR_TOKEN' -H 'If-Match: "124"' http://10.80.0.12:8053/api/v1/zones/example.com
+```
+
+To export a Zone for backup, use `GET` with `-o example.com.json`. `GET /zones`
+exports the full snapshot envelope, whose `zones` map contains the individual
+JSON files; that envelope is not itself an individual Zone file.
+
+Versions cover the **complete Zone set** and increase on each committed API
+mutation. Changes to another Zone can therefore invalidate a previously read
+ETag. Versions do not depend only on content hashes, so changing data back to an
+older value cannot make an old version valid again. Wildcard `If-Match` is not
+accepted; update/delete need the exact ETag. Missing preconditions return `428`;
+stale versions or duplicate creates return `412`. Reread and reconcile edits
+before retrying. Individual Zone bodies are limited to 8 MiB; the full serialized
+snapshot is limited to 64 MiB. Invalid JSON or DNS records return `400`, oversized
+requests return `413`, and an unknown Zone read returns `404`.
+
+Standbys and old masters return `409` with the current `master` information,
+without redirecting or forwarding writes. Rediscover and retry against the new
+master. Automation can also send `X-Master-Term: 12345` to require the discovered
+election term. Every write checks the election key, its lease and its term in
+the final etcd transaction, so an in-flight old-master request cannot commit
+after its election key is removed or replaced. Unavailable election/quorum
+returns `503`. If a request times out or loses its connection, its outcome may
+be unknown: rediscover and read the current data before retrying a mutation.
+
+Successful writes (`201` for creation, `200` for update/delete) report
+`committed: true`, a version, and a snapshot `revision`: this means etcd has
+committed the data. It does not mean every DNS node has applied it yet. The
+master pushes updates over existing WebSocket connections; compare that revision
+with each node's `applied_revision` from `/api/v1/nodes` to track propagation.
+Offline DNS nodes retain their last applied data and catch up on reconnection.
+
+API authority is recorded in etcd, preventing this version's publishing
+commands with stale file-mode configurations from replacing managed data. Keep all
+controllers in API mode after enabling it. To use the legacy file workflow,
+select `zone-mode = files` for a separate cluster name/prefix and import exported
+Zones there; changing only the local mode cannot undo the stored API authority.
 
 The earlier per-host configuration below remains supported, including external
 etcd HA, single-master, and original standalone DNS modes.
@@ -418,7 +523,7 @@ wins. Empty or invalid source directories are rejected and logged. Once a
 snapshot exists, restarts use cluster data even if the local source is stale or
 missing. No initial `-publish` command is required.
 
-For later changes, save the Zone JSON files in that node's `source-zones/`
+In the legacy `zone-mode = files` workflow, for later changes save the Zone JSON files in that node's `source-zones/`
 directory. The running HA node watches this directory, waits 500 ms for a burst
 of edits to settle, validates the complete snapshot, and automatically publishes
 it to etcd. The elected controller then pushes the update to every connected

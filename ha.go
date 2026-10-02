@@ -21,6 +21,7 @@ type haNode struct {
 	store        *zonesync.Store
 	httpAddr     string
 	bootstrapDir string
+	zoneMode     string
 	embedded     *embeddedNode
 }
 
@@ -39,6 +40,10 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		return nil, errors.New("HA node uses automatic discovery or explicit sync urls, not url")
 	}
 	controller := cfg.Controller.ResolvePaths(configFile)
+	zoneMode, err := zonesync.ZoneMode(controller.ZoneMode)
+	if err != nil {
+		return nil, err
+	}
 	if controller.Mode != "" && controller.Mode != "ha" {
 		return nil, fmt.Errorf("[controller] mode must be ha, got %q", controller.Mode)
 	}
@@ -101,6 +106,10 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		store.Close()
 		return nil, err
 	}
+	if err := cluster.SetZoneMode(zoneMode); err != nil {
+		store.Close()
+		return nil, err
+	}
 	if err := cluster.SetWeight(controller.Weight); err != nil {
 		store.Close()
 		return nil, err
@@ -110,7 +119,7 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		advertise = "http://" + httpAddr
 	}
 	if err := cluster.SetAdvertiseURL(advertise); err != nil {
-		if controller.Advertise != "" || cfg.Sync.URLs == "" {
+		if controller.Advertise != "" || cfg.Sync.URLs == "" || zoneMode == "api" {
 			store.Close()
 			return nil, fmt.Errorf("invalid controller advertise address (use a reachable WG address, or set advertise): %w", err)
 		}
@@ -127,7 +136,7 @@ func newHANode(cfg appconfig.AppConfig, zoneDir, configFile, httpAddr string, ht
 		store.Close()
 		return nil, err
 	}
-	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr, bootstrapDir: controller.ZoneDirectory, embedded: embedded}, nil
+	return &haNode{controller: cluster, follower: follower, store: store, httpAddr: httpAddr, bootstrapDir: controller.ZoneDirectory, embedded: embedded, zoneMode: zoneMode}, nil
 }
 
 func (n *haNode) Run(ctx context.Context) error {
@@ -162,6 +171,9 @@ func (n *haNode) Run(ctx context.Context) error {
 	})
 	if n.bootstrapDir != "" {
 		g.Go(func() error {
+			if n.zoneMode == "api" {
+				return n.store.ImportSource(ctx, n.bootstrapDir)
+			}
 			for ctx.Err() == nil {
 				err := n.store.WatchSource(ctx, n.bootstrapDir)
 				if ctx.Err() != nil {
@@ -202,6 +214,13 @@ func publishHANode(ctx context.Context, cfg appconfig.AppConfig, configFile stri
 		return "", errors.New("-publish requires [sync] mode = ha")
 	}
 	controller := cfg.Controller.ResolvePaths(configFile)
+	mode, err := zonesync.ZoneMode(controller.ZoneMode)
+	if err != nil {
+		return "", err
+	}
+	if mode == "api" {
+		return "", errors.New("-publish is disabled in zone-mode = api; update through the current master API")
+	}
 	if embedded != nil {
 		controller.EtcdEndpoints = strings.Join(embedded.endpoints(), ",")
 	}

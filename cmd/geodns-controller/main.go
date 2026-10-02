@@ -62,6 +62,9 @@ func main() {
 	}
 	switch opts.mode {
 	case "single":
+		if mode, err := zonesync.ZoneMode(appconfig.Config.Controller.ZoneMode); err != nil || mode == "api" {
+			log.Fatal("zone-mode = api requires HA controller mode")
+		}
 		if *publish || opts.etcdEndpoints != "" {
 			log.Fatal("-publish and -etcd require -mode ha")
 		}
@@ -74,6 +77,13 @@ func main() {
 		}
 		serve(master, master.Run, opts.listen)
 	case "ha":
+		zoneMode, err := zonesync.ZoneMode(appconfig.Config.Controller.ZoneMode)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if *publish && zoneMode == "api" {
+			log.Fatal("-publish is disabled in zone-mode = api; use the master API")
+		}
 		store, err := zonesync.DialStore(zonesync.EtcdOptions{
 			Endpoints: opts.etcdEndpoints, Prefix: opts.etcdPrefix, Username: opts.etcdUser,
 			PasswordFile: opts.etcdPasswordFile, CAFile: opts.etcdCA,
@@ -100,6 +110,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		if err := cluster.SetZoneMode(zoneMode); err != nil {
+			log.Fatal(err)
+		}
 		if err := cluster.SetWeight(appconfig.Config.Controller.Weight); err != nil {
 			log.Fatal(err)
 		}
@@ -107,13 +120,22 @@ func main() {
 		if advertise == "" {
 			advertise = "http://" + opts.listen
 		}
-		if err := cluster.SetAdvertiseURL(advertise); err != nil && appconfig.Config.Controller.Advertise != "" {
+		if err := cluster.SetAdvertiseURL(advertise); err != nil && (appconfig.Config.Controller.Advertise != "" || zoneMode == "api") {
 			log.Fatal(err)
 		}
 		if *checkConfig {
 			return
 		}
-		serve(cluster, cluster.Run, opts.listen)
+		start := cluster.Run
+		if zoneMode == "api" && appconfig.Config.Controller.ZoneDirectory != "" {
+			start = func(ctx context.Context) error {
+				g, ctx := errgroup.WithContext(ctx)
+				g.Go(func() error { return cluster.Run(ctx) })
+				g.Go(func() error { return store.ImportSource(ctx, opts.zoneDir) })
+				return g.Wait()
+			}
+		}
+		serve(cluster, start, opts.listen)
 	default:
 		log.Fatalf("unknown controller mode %q", opts.mode)
 	}
@@ -164,6 +186,7 @@ func serve(handler syncHandler, start func(context.Context) error, listen string
 
 func run(ctx context.Context, handler syncHandler, start func(context.Context) error, listen string) error {
 	mux := http.NewServeMux()
+	zonesync.RegisterManagementRoutes(mux, handler)
 	mux.Handle(zonesync.Path, handler)
 	mux.HandleFunc(zonesync.StreamPath, handler.ServeStream)
 	mux.HandleFunc(zonesync.NodesPath, handler.ServeNodes)
